@@ -3,18 +3,26 @@
 
 namespace Params
 {
-juce::StringArray keyNames()
-{
-    return { "Auto", "C / Am", "Db / Bbm", "D / Bm", "Eb / Cm", "E / C#m", "F / Dm",
-             "F# / D#m", "G / Em", "Ab / Fm", "A / F#m", "Bb / Gm", "B / G#m" };
-}
+juce::StringArray keyNames() { return { "Auto", "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B" }; }
 
-juce::StringArray lookaheadNames() { return { "250 ms", "500 ms", "1 s", "2 s" }; }
+juce::StringArray lookaheadNames() { return { "Live (30 ms)", "250 ms", "500 ms", "1 s", "2 s" }; }
 
 double lookaheadSeconds (int index)
 {
-    static const double s[] = { 0.25, 0.5, 1.0, 2.0 };
-    return s[juce::jlimit (0, 3, index)];
+    static const double s[] = { 0.0, 0.25, 0.5, 1.0, 2.0 };   // 0 = live mode
+    return s[juce::jlimit (0, 4, index)];
+}
+
+namespace
+{
+    template <typename NameFn>
+    juce::StringArray names (int count, NameFn fn)
+    {
+        juce::StringArray a;
+        for (int i = 0; i < count; ++i)
+            a.add (fn (i));
+        return a;
+    }
 }
 
 namespace
@@ -62,12 +70,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    juce::StringArray intervals;
-    for (int i = 0; i < Intervals::count; ++i)
-        intervals.add (Intervals::name (i));
+    const auto intervals = names (Intervals::count, Intervals::name);
+    const auto positions = names (Positions::count, Positions::name);
+    const auto motions = names (Motions::count, Motions::name);
 
-    // defaults: 3rd up, 4th down (a triad around the lead), octave down
+    // defaults: a chord tone above and below the lead, and a held bass; in Intervals mode 3rd up, 4th down, octave down
     const int defInterval[3] = { 2, 8, 11 };
+    const int defPosition[3] = { Positions::Above, Positions::Below, Positions::Bass };
+    const int defMotion[3] = { Motions::Follow, Motions::Follow, Motions::Hold };
     const float defPan[3] = { 0.35f, -0.35f, 0.0f };
     const float defDelay[3] = { 0.0f, 12.0f, 6.0f };
 
@@ -77,6 +87,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
         auto group = std::make_unique<juce::AudioProcessorParameterGroup> ("voice" + juce::String (v + 1), "Voice " + juce::String (v + 1), "|");
 
         group->addChild (std::make_unique<APC> (pid (vid (v, interval)), n + "Interval", intervals, defInterval[v]));
+        group->addChild (std::make_unique<APC> (pid (vid (v, position)), n + "Position", positions, defPosition[v]));
+        group->addChild (std::make_unique<APC> (pid (vid (v, motion)), n + "Motion", motions, defMotion[v]));
         group->addChild (std::make_unique<APF> (pid (vid (v, level)), n + "Level", range (-48.0f, 6.0f, 0.1f), -4.0f, dbText (-47.9f, "Off")));
         group->addChild (std::make_unique<APF> (pid (vid (v, pan)), n + "Pan", range (-1.0f, 1.0f, 0.01f), defPan[v], panText()));
         group->addChild (std::make_unique<APF> (pid (vid (v, delay)), n + "Delay", skewed (0.0f, 250.0f, 40.0f), defDelay[v], msText()));
@@ -87,7 +99,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 
     auto global = std::make_unique<juce::AudioProcessorParameterGroup> ("global", "Global", "|");
     global->addChild (std::make_unique<APC> (pid (key), "Key", keyNames(), 0));
-    global->addChild (std::make_unique<APC> (pid (lookahead), "Lookahead", lookaheadNames(), 2));
+    global->addChild (std::make_unique<APC> (pid (mode), "Mode", juce::StringArray { "Auto", "Major", "Minor" }, 0));
+    global->addChild (std::make_unique<juce::AudioParameterBool> (pid (keyLock), "Key Lock", false));
+    global->addChild (std::make_unique<APC> (pid (lookahead), "Lookahead", lookaheadNames(), 3));
+    global->addChild (std::make_unique<APC> (pid (harmony), "Harmony Mode", names (HarmonyModes::count, HarmonyModes::name),
+                                             HarmonyModes::ChordsAuto));
+    global->addChild (std::make_unique<APC> (pid (singOn), "Sing On", names (SingModes::count, SingModes::name), SingModes::All));
+    global->addChild (std::make_unique<APF> (pid (longNote), "Long Note", skewed (150.0f, 1500.0f, 400.0f), 400.0f, msText()));
     global->addChild (std::make_unique<API> (pid (voices), "Voices", 1, 3, 2));
     global->addChild (std::make_unique<APF> (pid (dry), "Dry", range (-60.0f, 6.0f, 0.1f), 0.0f, dbText (-59.9f, "Off")));
     global->addChild (std::make_unique<APF> (pid (wet), "Harmony", range (-60.0f, 6.0f, 0.1f), 0.0f, dbText (-59.9f, "Off")));

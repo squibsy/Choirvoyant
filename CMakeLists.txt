@@ -14,7 +14,8 @@ add_subdirectory(libs/JUCE)
 add_library(HarmonyEngine STATIC
     Source/Engine/HarmonyEngine.cpp
     Source/Engine/PitchTracker.cpp
-    Source/Engine/KeyFinder.cpp)
+    Source/Engine/KeyFinder.cpp
+    Source/Engine/Chords.cpp)
 target_include_directories(HarmonyEngine PUBLIC Source/Engine)
 set_target_properties(HarmonyEngine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
@@ -31,7 +32,7 @@ juce_add_plugin(Choirvoyant
     PLUGIN_CODE Chv1
     PRODUCT_NAME "Choirvoyant"
     IS_SYNTH FALSE
-    NEEDS_MIDI_INPUT FALSE
+    NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
@@ -48,6 +49,7 @@ target_compile_definitions(Choirvoyant PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0   # only notes are used; don't add 2000+ CC parameters
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
 target_link_libraries(Choirvoyant

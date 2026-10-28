@@ -80,31 +80,52 @@ namespace
             w->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
     }
 
+    // MIDI for a test run: absolute sample positions
+    using MidiTrack = std::vector<HarmonyEngine::MidiEvent>;
+    using NoteList = std::vector<HarmonyEngine::NoteInfo>;
+
     juce::AudioBuffer<float> runEngine (const std::vector<float>& mono, const HarmonySettings& s, double lookahead,
-                                        double* cpuPercent = nullptr, int* rootOut = nullptr)
+                                        double* cpuPercent = nullptr, int* rootOut = nullptr, const MidiTrack* midi = nullptr,
+                                        NoteList* notesOut = nullptr, int* latencyOut = nullptr)
     {
         HarmonyEngine engine;
         engine.prepare (sr, lookahead);
         const int lat = engine.getLatencySamples();
         const int total = (int) mono.size() + lat;
+        if (latencyOut != nullptr)
+            *latencyOut = lat;
 
         juce::AudioBuffer<float> out (2, total);
         std::vector<float> in ((size_t) total, 0.0f);
         std::copy (mono.begin(), mono.end(), in.begin());
 
+        MidiTrack block;
+        size_t next = 0;
         const auto t0 = juce::Time::getHighResolutionTicks();
         for (int pos = 0; pos < total; pos += 256)
         {
             const int n = juce::jmin (256, total - pos);
+            block.clear();
+            while (midi != nullptr && next < midi->size() && (*midi)[next].offset < pos + n)
+            {
+                auto e = (*midi)[next++];
+                e.offset = juce::jmax (0, e.offset - pos);
+                block.push_back (e);
+            }
             const float* ins[1] = { in.data() + pos };
             float* outs[2] = { out.getWritePointer (0, pos), out.getWritePointer (1, pos) };
-            engine.process (ins, 1, outs, 2, n, s);
+            engine.process (ins, 1, outs, 2, n, s, block.data(), (int) block.size());
         }
         const double secs = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0);
         if (cpuPercent != nullptr)
             *cpuPercent = 100.0 * secs / ((double) total / sr);
         if (rootOut != nullptr)
             *rootOut = engine.statusRoot.load();
+        if (notesOut != nullptr)
+        {
+            notesOut->clear();
+            engine.forEachNote ([notesOut] (const HarmonyEngine::NoteInfo& info) { notesOut->push_back (info); });
+        }
 
         // drop the latency so output lines up with the input
         juce::AudioBuffer<float> aligned (2, (int) mono.size());
@@ -167,6 +188,293 @@ namespace
         return m;
     }
 
+    //==========================================================================
+    // v2 checks: chord modes, MIDI, Sing On, live mode
+    //==========================================================================
+
+    // C major, one bar per chord: I vi IV V I. Each bar: two chord tones, a quick passing note, a chord tone.
+    struct Bar { int degree; int notes[4]; };
+    const Bar progression[] = { { 0, { 64, 67, 69, 67 } }, { 5, { 69, 72, 71, 69 } }, { 3, { 65, 69, 67, 65 } },
+                                { 4, { 67, 71, 72, 74 } }, { 0, { 64, 60, 62, 60 } } };
+    constexpr double barDur[4] = { 0.45, 0.45, 0.12, 0.6 };
+
+    std::vector<SungNote> progressionMelody (std::vector<int>& barOf, std::vector<double>& barStart, double& totalSec)
+    {
+        std::vector<SungNote> m;
+        double t = 0.3;
+        for (int b = 0; b < 5; ++b)
+        {
+            barStart.push_back (t);
+            for (int k = 0; k < 4; ++k)
+            {
+                m.push_back ({ progression[b].notes[k], t, barDur[k], false });
+                barOf.push_back (b);
+                t += barDur[k] + (k == 2 ? 0.0 : 0.05);
+            }
+        }
+        barStart.push_back (t);
+        totalSec = t + 0.5;
+        return m;
+    }
+
+    const HarmonyEngine::NoteInfo* findNote (const NoteList& notes, double start)
+    {
+        const HarmonyEngine::NoteInfo* best = nullptr;
+        for (const auto& n : notes)
+            if (std::abs (n.start - start) < 0.07 && (best == nullptr || std::abs (n.start - start) < std::abs (best->start - start)))
+                best = &n;
+        return best;
+    }
+
+    int pc (int p) { return ((p % 12) + 12) % 12; }
+
+    HarmonySettings plainVoices (int numVoices)
+    {
+        HarmonySettings s;
+        s.voices = numVoices;
+        s.dryDb = -60.0f;
+        s.entryLagMs = s.humanize = s.vibDepthCents = s.consonants = 0.0f;
+        for (auto& v : s.voice)
+            v.levelDb = 0.0f;
+        return s;
+    }
+
+    int runV2Checks()
+    {
+        int failures = 0;
+        std::vector<int> barOf;
+        std::vector<double> barStart;
+        double totalSec = 0.0;
+        const auto melody = progressionMelody (barOf, barStart, totalSec);
+        const auto vocal = synthVocal (melody, totalSec);
+        Chords::Chord diatonicC[Chords::numDiatonic];
+        Chords::diatonic (0, false, diatonicC);
+
+        // ---- chord choice + voice leading (Chords Auto, 3 voices) ----
+        // The key is fixed: the first two bars never sing F or F#, so C and G major fit equally
+        // well and key detection (tested above) could take either. This checks the chord choice.
+        {
+            auto s = plainVoices (3);
+            s.harmonyMode = HarmonyModes::ChordsAuto;
+            s.keyMode = 1;      // C
+            s.scaleMode = 1;    // major
+            NoteList notes;
+            runEngine (vocal, s, 1.0, nullptr, nullptr, nullptr, &notes);
+
+            int right = 0, passingKept = 0, passing = 0, inChord = 0, ordered = 0, doubled = 0, counted = 0, bassMoves = 0, chordChanges = 0;
+            int shared = 0, noThird = 0;
+            std::vector<float> moves;
+            const HarmonyEngine::NoteInfo* prev = nullptr;
+            std::printf ("chords (auto), expected I vi IV V I:\n    ");
+            for (size_t i = 0; i < melody.size(); ++i)
+            {
+                const auto* n = findNote (notes, melody[i].start);
+                if (n == nullptr)
+                {
+                    std::printf ("?? ");
+                    continue;
+                }
+                char name[16];
+                Chords::name (n->chord, name, (int) sizeof (name));
+                const bool ok = n->chord.mask == diatonicC[progression[barOf[i]].degree].mask;
+                std::printf ("%s%s ", name, ok ? "" : "*");
+                right += ok ? 1 : 0;
+                if (melody[i].dur < 0.2)
+                {
+                    ++passing;
+                    passingKept += ok ? 1 : 0;
+                }
+                else
+                {
+                    ++counted;
+                    const int t0 = juce::roundToInt (n->target[0]), t1 = juce::roundToInt (n->target[1]), t2 = juce::roundToInt (n->target[2]);
+                    inChord += n->chord.has (t0) && n->chord.has (t1) && pc (t2) == n->chord.root ? 1 : 0;
+                    ordered += t0 > n->name && n->name > t1 && t1 > t2 ? 1 : 0;
+                    doubled += pc (t0) == pc (n->name) || pc (t1) == pc (n->name) ? 1 : 0;
+                    // doubling the root (and leaving out the 5th) is a normal close-harmony voicing;
+                    // two voices on the 3rd or 5th is the weak case
+                    shared += pc (t0) == pc (t1) && pc (t0) != n->chord.root ? 1 : 0;
+                    const int third = pc (n->chord.root + (n->chord.has (n->chord.root + 4) ? 4 : 3));
+                    noThird += pc (t0) != third && pc (t1) != third && pc (n->name) != third ? 1 : 0;
+                }
+                if (prev != nullptr)
+                {
+                    moves.push_back (std::abs (n->target[0] - prev->target[0]));
+                    moves.push_back (std::abs (n->target[1] - prev->target[1]));
+                    bassMoves += juce::roundToInt (n->target[2]) != juce::roundToInt (prev->target[2]) ? 1 : 0;
+                    chordChanges += n->chord.mask != prev->chord.mask ? 1 : 0;
+                }
+                prev = n;
+            }
+            std::sort (moves.begin(), moves.end());
+            const float medianMove = moves.empty() ? 99.0f : moves[moves.size() / 2];
+            std::printf ("\n    %d/%zu chords right (%d/%d passing notes kept their bar's chord)\n", right, melody.size(), passingKept, passing);
+            std::printf ("    voice leading: chord tones %d/%d, ordered %d/%d, lead doubled %d/%d, median move %.1f st, bass moves %d (chord changes %d)\n",
+                         inChord, counted, ordered, counted, doubled, counted, medianMove, bassMoves, chordChanges);
+            std::printf ("    upper voices doubling the 3rd or 5th %d/%d, chord missing its 3rd %d/%d\n", shared, counted, noThird, counted);
+            if (right * 10 < (int) melody.size() * 8 || inChord != counted || ordered != counted || doubled * 10 > counted
+                || medianMove > 3.0f || bassMoves > chordChanges || shared * 10 > counted || noThird * 10 > counted)
+                ++failures;
+        }
+
+        // ---- the synthesized voice really sings the chosen target ----
+        {
+            auto s = plainVoices (1);
+            s.harmonyMode = HarmonyModes::ChordsAuto;
+            NoteList notes;
+            const auto out = runEngine (vocal, s, 1.0, nullptr, nullptr, nullptr, &notes);
+            int bad = 0, checked = 0;
+            for (const auto& m : melody)
+            {
+                const auto* n = findNote (notes, m.start);
+                if (m.dur < 0.2 || n == nullptr)
+                    continue;
+                const int a = (int) ((m.start + 0.08) * sr), b = (int) ((m.start + m.dur - 0.04) * sr);
+                const float got = medianPitch (out.getReadPointer (0) + a, b - a);
+                ++checked;
+                bad += std::abs (got - (n->target[0] + n->tuning)) < 0.5f ? 0 : 1;
+            }
+            std::printf ("    rendered voice on its chord target: %d/%d notes\n", checked - bad, checked);
+            if (bad > 0)
+                ++failures;
+        }
+
+        // ---- MIDI chords override the progression; MIDI notes are sung exactly ----
+        {
+            // Em  F  Dm  G7  C  (each fits the melody, none is the auto choice except the last)
+            const std::vector<std::vector<int>> chords = { { 52, 55, 59 }, { 53, 57, 60 }, { 50, 53, 57 }, { 55, 59, 62, 65 }, { 48, 52, 55 } };
+            MidiTrack track;
+            std::vector<Chords::Chord> expected;
+            for (int b = 0; b < 5; ++b)
+            {
+                const int on = (int) ((barStart[(size_t) b] - 0.02) * sr), off = (int) ((barStart[(size_t) b + 1] - 0.03) * sr);
+                for (int nn : chords[(size_t) b])
+                    track.push_back ({ on, true, nn });
+                for (int nn : chords[(size_t) b])
+                    track.push_back ({ off, false, nn });
+                expected.push_back (Chords::fromNotes (chords[(size_t) b].data(), (int) chords[(size_t) b].size()));
+            }
+
+            auto s = plainVoices (1);
+            s.harmonyMode = HarmonyModes::ChordsMidi;
+            NoteList notes;
+            const auto out = runEngine (vocal, s, 1.0, nullptr, nullptr, &track, &notes);
+            int chordOk = 0, pitchOk = 0, checked = 0;
+            for (size_t i = 0; i < melody.size(); ++i)
+            {
+                const auto& m = melody[i];
+                const auto* n = findNote (notes, m.start);
+                if (m.dur < 0.2 || n == nullptr)
+                    continue;
+                ++checked;
+                const auto& want = expected[(size_t) barOf[i]];
+                chordOk += n->chord.mask == want.mask ? 1 : 0;
+                const int a = (int) ((m.start + 0.08) * sr), b = (int) ((m.start + m.dur - 0.04) * sr);
+                pitchOk += want.has (juce::roundToInt (medianPitch (out.getReadPointer (0) + a, b - a))) ? 1 : 0;
+            }
+            std::printf ("chords (MIDI): chord followed %d/%d, rendered pitch in the MIDI chord %d/%d\n", chordOk, checked, pitchOk, checked);
+            if (chordOk != checked || pitchOk != checked)
+                ++failures;
+
+            // MIDI notes: hold E5 + C5 throughout; voice 1 sings E5, voice 2 C5
+            MidiTrack held = { { 0, true, 76 }, { 0, true, 72 } };
+            auto s2 = plainVoices (2);
+            s2.harmonyMode = HarmonyModes::MidiNotes;
+            s2.voice[1].levelDb = -60.0f;   // listen to voice 1 alone
+            const auto out2 = runEngine (vocal, s2, 1.0, nullptr, nullptr, &held, &notes);
+            int exact = 0, targetsOk = 0;
+            checked = 0;
+            for (const auto& m : melody)
+            {
+                const auto* n = findNote (notes, m.start);
+                if (m.dur < 0.2 || n == nullptr)
+                    continue;
+                ++checked;
+                targetsOk += std::abs (n->target[0] + n->tuning - 76.0f) < 0.01f && std::abs (n->target[1] + n->tuning - 72.0f) < 0.01f ? 1 : 0;
+                const int a = (int) ((m.start + 0.08) * sr), b = (int) ((m.start + m.dur - 0.04) * sr);
+                exact += std::abs (medianPitch (out2.getReadPointer (0) + a, b - a) - 76.0f) < 0.3f ? 1 : 0;
+            }
+            std::printf ("MIDI notes: targets %d/%d, rendered voice 1 on E5 within 0.3 st %d/%d\n", targetsOk, checked, exact, checked);
+            if (targetsOk != checked || exact != checked)
+                ++failures;
+        }
+
+        // ---- Sing On: Long Notes ----
+        {
+            std::vector<SungNote> m;
+            double t = 0.3;
+            for (int k = 0; k < 8; ++k)
+            {
+                const double d = k % 2 ? 0.8 : 0.25;
+                m.push_back ({ 67 + (k % 3) * 2, t, d, false });
+                t += d + 0.05;
+            }
+            const auto v = synthVocal (m, t + 0.5);
+            auto s = plainVoices (1);
+            s.harmonyMode = HarmonyModes::ChordsAuto;
+            s.singOn = SingModes::LongNotes;
+            s.longNoteMs = 400.0f;
+            const auto out = runEngine (v, s, 1.0);
+
+            double eShort = 0.0, eLong = 0.0;
+            for (const auto& n : m)
+            {
+                const int a = (int) ((n.start + 0.05) * sr), b = (int) ((n.start + n.dur - 0.05) * sr);
+                double e = 0.0;
+                for (int k = a; k < b; ++k)
+                    e += (double) out.getSample (0, k) * out.getSample (0, k);
+                (n.dur < 0.4 ? eShort : eLong) += e / (b - a);
+            }
+            const double diff = 10.0 * std::log10 ((eLong + 1e-12) / (eShort + 1e-12));
+            std::printf ("sing on long notes: long notes %.1f dB louder than short ones\n", diff);
+            if (diff < 30.0)
+                ++failures;
+        }
+
+        // ---- live mode ----
+        {
+            double total = 0.0;
+            const auto m = testMelody (0, total);
+            const auto v = synthVocal (m, total);
+            auto s = plainVoices (1);
+            s.harmonyMode = HarmonyModes::Intervals;
+            int lat = 0;
+            double cpu = 0.0;
+            const auto out = runEngine (v, s, 0.0, &cpu, nullptr, nullptr, nullptr, &lat);
+            int bad = 0, checked = 0;
+            for (const auto& n : m)
+            {
+                if (n.start < 2.0 || n.dur < 0.1)
+                    continue;   // the key needs a couple of seconds without lookahead
+                const int a = (int) ((n.start + 0.08) * sr), b = (int) ((n.start + n.dur - 0.04) * sr);
+                const float got = medianPitch (out.getReadPointer (0) + a, b - a);
+                ++checked;
+                bad += std::abs (got - (float) diatonicUp (n.midi, 7, 2)) < 0.5f ? 0 : 1;
+            }
+            std::printf ("live mode: latency %.1f ms, 3rd up right on %d/%d notes after 2 s, %.2f%% CPU\n", 1000.0 * lat / sr,
+                         checked - bad, checked, cpu);
+            if (lat > (int) (0.03 * sr) + 1 || bad > 1)
+                ++failures;
+        }
+
+        // ---- full patch in chord mode: CPU and stability ----
+        {
+            auto s = plainVoices (3);
+            s.harmonyMode = HarmonyModes::ChordsAuto;
+            s.stack = 3;
+            s.humanize = 0.3f;
+            s.entryLagMs = 25.0f;
+            double cpu = 0.0;
+            const auto out = runEngine (vocal, s, 1.0, &cpu);
+            const float peak = out.getMagnitude (0, out.getNumSamples());
+            std::printf ("chord mode full patch: %.2f%% CPU, peak %.2f\n", cpu, peak);
+            if (! std::isfinite (peak) || peak > 4.0f)
+                ++failures;
+        }
+
+        return failures;
+    }
+
     int runChecks()
     {
         int failures = 0;
@@ -182,6 +490,7 @@ namespace
             for (int interval : { 2, 4, 7 })   // 3rd up, 5th up, 3rd down
             {
                 HarmonySettings s;
+                s.harmonyMode = HarmonyModes::Intervals;
                 s.voices = 1;
                 s.voice[0].interval = interval;
                 s.voice[0].levelDb = 0.0f;
@@ -245,6 +554,7 @@ namespace
             }
             const auto vocal = synthVocal (m, t + 0.5);
             HarmonySettings s;
+            s.harmonyMode = HarmonyModes::Intervals;
             s.voices = 1;
             s.voice[0].levelDb = 0.0f;
             s.dryDb = -60.0f;
@@ -275,6 +585,7 @@ namespace
             const auto melody = testMelody (0, totalSec);
             const auto vocal = synthVocal (melody, totalSec);
             HarmonySettings s;
+            s.harmonyMode = HarmonyModes::Intervals;
             s.voices = 3;
             s.voice[0].interval = 2;
             s.voice[1].interval = 8;  s.voice[1].pan = -0.6f; s.voice[1].delayMs = 20.0f;
@@ -308,6 +619,8 @@ namespace
             if (! std::isfinite (peak) || peak > 4.0f)
                 ++failures;
         }
+
+        failures += runV2Checks();
 
         std::printf (failures == 0 ? "\nALL CHECKS PASSED\n" : "\n%d FAILURES\n", failures);
         return failures == 0 ? 0 : 1;
@@ -402,9 +715,12 @@ namespace
             if (pass == 0 && std::getenv ("CHV_NOTES") != nullptr)
             {
                 int k = 0;
-                engine.forEachNote ([&k] (double a, double b, float midi, int name) {
+                engine.forEachNote ([&k] (const HarmonyEngine::NoteInfo& n) {
+                    char chord[16];
+                    Chords::name (n.chord, chord, (int) sizeof (chord));
                     if (k++ < 80)
-                        std::printf ("  note %3d  %6.2f-%6.2f s  %6.2f  -> %s%d\n", k, a, b, midi, noteName (name), name / 12 - 1);
+                        std::printf ("  note %3d  %6.2f-%6.2f s  %6.2f  -> %s%d  chord %s\n", k, n.start, n.end, n.midi,
+                                     noteName (n.name), n.name / 12 - 1, chord);
                 });
             }
 

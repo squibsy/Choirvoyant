@@ -12,10 +12,17 @@ namespace Params
     constexpr const char* pan      = "pan";
     constexpr const char* delay    = "delay";
     constexpr const char* formant  = "formant";
+    constexpr const char* position = "position";
+    constexpr const char* motion   = "motion";
 
     // ---- Global ----
     constexpr const char* key         = "key";
+    constexpr const char* mode        = "mode";
+    constexpr const char* keyLock     = "keylock";
     constexpr const char* lookahead   = "lookahead";
+    constexpr const char* harmony     = "harmony";
+    constexpr const char* singOn      = "singon";
+    constexpr const char* longNote    = "longnote";
     constexpr const char* voices      = "voices";
     constexpr const char* stack       = "stack";
     constexpr const char* stackDetune = "stackdetune";
@@ -32,9 +39,9 @@ namespace Params
     constexpr const char* dry         = "dry";
     constexpr const char* wet         = "wet";
 
-    juce::StringArray keyNames();       // "Auto", then the 12 scales
+    juce::StringArray keyNames();       // "Auto", then the 12 tonics
     juce::StringArray lookaheadNames();
-    double lookaheadSeconds (int index);
+    double lookaheadSeconds (int index); // 0 = live mode
 
     juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 }

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "Chords.h"
 #include "KeyFinder.h"
 #include "PitchTracker.h"
 
@@ -26,22 +27,73 @@ namespace Intervals
     }
 }
 
+// Where a voice sits relative to the lead in the chord modes.
+namespace Positions
+{
+    enum : int { Above, AboveWide, Below, BelowWide, Bass, count };
+    inline const char* name (int i)
+    {
+        static const char* names[count] = { "Above", "Above Wide", "Below", "Below Wide", "Bass" };
+        return names[i];
+    }
+}
+
+// How a voice moves from note to note in the chord modes.
+namespace Motions
+{
+    enum : int { Follow, Hold, Contrary, count };
+    inline const char* name (int i)
+    {
+        static const char* names[count] = { "Follow", "Hold", "Contrary" };
+        return names[i];
+    }
+}
+
+namespace HarmonyModes
+{
+    enum : int { Intervals, ChordsAuto, ChordsMidi, MidiNotes, count };
+    inline const char* name (int i)
+    {
+        static const char* names[count] = { "Intervals", "Chords (Auto)", "Chords (MIDI)", "MIDI Notes" };
+        return names[i];
+    }
+}
+
+namespace SingModes
+{
+    enum : int { All, LongNotes, PhraseEnds, count };
+    inline const char* name (int i)
+    {
+        static const char* names[count] = { "All Notes", "Long Notes", "Phrase Ends" };
+        return names[i];
+    }
+}
+
 struct VoiceSettings
 {
-    int interval = 2;
+    int interval = 2;           // Intervals mode
     float levelDb = -4.0f;
     float pan = 0.0f;           // -1..1
     float delayMs = 0.0f;
     float formantSemis = 0.0f;  // manual offset on top of the automatic amount
+    int position = Positions::Above;    // chord modes
+    int motion = Motions::Follow;
 };
 
 struct HarmonySettings
 {
-    int keyMode = 0;            // 0 = auto, 1..12 = fixed scale on C..B (major / relative minor)
+    int keyMode = 0;            // 0 = auto, 1..12 = tonic C..B
+    int scaleMode = 0;          // 0 = auto, 1 = major, 2 = minor (auto with a fixed tonic means major)
+    bool keyLock = false;       // freeze the detected key; only the tuning grid keeps following
+
+    int harmonyMode = HarmonyModes::ChordsAuto;
+    int singOn = SingModes::All;
+    float longNoteMs = 400.0f;
+
     int voices = 2;             // 1..3
-    VoiceSettings voice[3] = { { 2, -4.0f, 0.35f, 0.0f, 0.0f },     // same defaults as the plugin:
-                               { 8, -4.0f, -0.35f, 12.0f, 0.0f },   // 3rd up, 4th down, octave down
-                               { 11, -4.0f, 0.0f, 6.0f, 0.0f } };
+    VoiceSettings voice[3] = { { 2, -4.0f, 0.35f, 0.0f, 0.0f, Positions::Above, Motions::Follow },     // same defaults as the plugin
+                               { 8, -4.0f, -0.35f, 12.0f, 0.0f, Positions::Below, Motions::Follow },
+                               { 11, -4.0f, 0.0f, 6.0f, 0.0f, Positions::Bass, Motions::Hold } };
 
     int stack = 1;              // copies per voice, 1..3
     float stackDetuneCents = 8.0f;
@@ -64,39 +116,65 @@ struct HarmonySettings
 };
 
 // Lookahead harmonizer. The output is the input delayed by the lookahead time; analysis
-// runs at the input, so every decision about a note (its key, its length, whether it is
-// a passing tone) is made with that much of the future already known.
+// runs at the input, so every decision about a note (its key, its chord, its length, whether
+// it is a passing tone) is made with that much of the future already known. Live mode keeps
+// only the ~30 ms the pitch analysis itself needs.
 class HarmonyEngine
 {
 public:
     static constexpr double maxLookaheadSeconds = 2.0;
+    static constexpr double liveLatencySeconds = 0.03;
     static constexpr int maxInstances = 9;   // 3 voices x 3 stack copies
 
+    struct MidiEvent
+    {
+        int offset;   // sample within the block
+        bool on;
+        int note;
+    };
+
     void prepare (double sampleRate, double lookaheadSeconds);
-    void setLookahead (double seconds);      // no allocation; clears all state
+    void setLookahead (double seconds);      // <= 0 selects live mode. No allocation; clears all state
     void reset();
     int getLatencySamples() const { return latency; }
+    bool isLive() const { return live; }
 
-    // test/debug: the stored notes, oldest first (start/end in seconds, median MIDI pitch, note name used)
+    // test/debug: what the engine decided for each stored note
+    struct NoteInfo
+    {
+        double start, end;          // seconds
+        float midi, tuning;         // sung pitch and the grid it was named on
+        int name;                   // note name on that grid
+        bool harmonized;
+        Chords::Chord chord;        // on the grid
+        float target[3];            // harmony notes on the grid (sounding pitch = target + tuning)
+        bool voiceOn[3];
+    };
+
     template <typename Fn>
-    void forEachNote (Fn&& fn) const
+    void forEachNote (Fn&& fn) const   // oldest first
     {
         for (i64 i = std::max<i64> (0, numNotes - (i64) notes.size() + 1); i < numNotes; ++i)
         {
             const auto& n = note (i);
-            fn ((double) n.start / sr, (double) noteEnd (n) / sr, n.midi, (int) std::lround (n.midi - n.tuning));
+            NoteInfo info { (double) n.start / sr, (double) noteEnd (n) / sr, n.midi, n.tuning, (int) std::lround (n.midi - n.tuning),
+                            n.harmDone, n.chord, { n.target[0], n.target[1], n.target[2] }, { n.voiceOn[0], n.voiceOn[1], n.voiceOn[2] } };
+            fn (info);
         }
     }
 
-    // in/out may alias. numIn, numOut: 1 or 2.
-    void process (const float* const* in, int numIn, float* const* out, int numOut, int numSamples, const HarmonySettings& s);
+    // in/out may alias. numIn, numOut: 1 or 2. MIDI events must be sorted by offset.
+    void process (const float* const* in, int numIn, float* const* out, int numOut, int numSamples, const HarmonySettings& s,
+                  const MidiEvent* midi = nullptr, int numMidi = 0);
 
     // status for the editor (written on the audio thread)
-    std::atomic<int> statusRoot { -1 };      // -1 until a key is known
+    std::atomic<int> statusRoot { -1 };      // major-scale root, -1 until a key is known
     std::atomic<bool> statusMinor { false };
     std::atomic<float> statusLeadMidi { 0.0f }; // 0 when unvoiced
     std::atomic<float> statusTuning { 0.0f };   // singer's offset from A440, semitones
     std::atomic<float> statusTarget[3] { { 0.0f }, { 0.0f }, { 0.0f } };
+    std::atomic<int> statusChordRoot { -1 }, statusChordQuality { 0 };
+    std::atomic<uint16_t> statusChordMask { 0 };
 
 private:
     using i64 = int64_t;
@@ -122,16 +200,26 @@ private:
         float pitches[32] {};
         int numPitches = 0;
 
-        // per voice: harmony target, cached the first time the voice reads this note
-        bool targetDone[3] {};
-        int targetInterval[3] {}, targetKey[3] {};
-        float target[3] {};
-        int leadRef[3] {};                  // scale note the lead was heard as (before harmonizing)
+        // harmony for all voices, cached the first time any voice reads this note
+        bool harmDone = false;
+        uint32_t harmSig = 0;               // settings it was computed with
+        Chords::Chord chord;                // chord modes
+        int chordDegree = -1;               // diatonic degree when chosen automatically
+        float target[3] {};                 // harmony notes on the singer's grid
+        int leadRef[3] {};                  // note the lead was heard as, per voice
+        bool voiceOn[3] {};
 
         // per instance: entry timing, cached when the instance reaches this note
         bool entryDone[maxInstances] {};
         float lag[maxInstances] {}, catchUp[maxInstances] {};
         float jitLag[maxInstances] {}, jitDet[maxInstances] {};
+    };
+
+    struct ChordEntry
+    {
+        i64 t = 0;
+        int notes[8] {};
+        int count = 0;
     };
 
     struct Instance
@@ -152,20 +240,31 @@ private:
     void closeNote (i64 end);
     void computeKey (i64 frameIndex);
     void placeMarks();
+    void handleMidi (const MidiEvent& e, i64 t);
 
     // ---- lookups ----
     const Frame& frameAt (double t) const;
     float consonanceAt (double t) const;
     int keyAt (double t) const;
+    bool keyMinorAt (double t) const;
     float tuningAt (double t) const;
+    void scaleAt (double t, const HarmonySettings& s, int& majorRoot, int& tonic, bool& minor) const;
     i64 noteIndexAt (double t) const;       // last note starting at or before t, -1 if none
     Note& note (i64 i) { return notes[(size_t) (i & noteMask)]; }
     const Note& note (i64 i) const { return notes[(size_t) (i & noteMask)]; }
     bool noteValid (i64 i) const { return i >= 0 && i < numNotes && i >= numNotes - (i64) notes.size() + 1; }
     i64 noteEnd (const Note& n) const { return n.end >= 0 ? n.end : analysedUpTo; }
+    const ChordEntry* midiChordAt (double t) const;
     i64 nearestMark (double t) const;
     float sourceAt (double t) const;
-    float targetFor (i64 noteIdx, int voice, const HarmonySettings& s, int depth = 0);
+
+    // ---- harmony ----
+    void harmonize (i64 noteIdx, const HarmonySettings& s, int depth = 0);
+    int chooseDegree (i64 noteIdx, int prevDegree, const Chords::Chord chords[], float grid);
+    void voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, const HarmonySettings& s,
+                     float out[3]) const;
+    bool noteSings (i64 noteIdx, double t, const HarmonySettings& s) const;
+    static uint32_t signature (const HarmonySettings& s, bool live);
 
     // ---- synthesis ----
     void synthesise (int instance, double genLimit, const HarmonySettings& s);
@@ -173,13 +272,15 @@ private:
     float random01();
 
     double sr = 48000.0;
-    int latency = 0, hop = 256, frameLen = 2048, maxHalf = 1024;
+    int latency = 0, hop = 256, frameLen = 2048, maxHalf = 1024, medianRadius = 2, onsetFrames = 3;
+    bool live = false;
     float uvSpacing = 240.0f;
 
     std::vector<float> src, dryL, dryR, scratch;
     i64 srcMask = 0, head = 0;
 
-    PitchTracker tracker;
+    PitchTracker trackerFull, trackerLive;
+    PitchTracker* tracker = &trackerFull;
     std::vector<Frame> rawFrames, frames;
     std::vector<int8_t> keyTrack;
     std::vector<uint8_t> keyMinor;
@@ -194,9 +295,15 @@ private:
     i64 candStart = 0, devStart = 0, uvStart = 0;
 
     KeyFinder keyFinder;
-    int analysisKeyMode = 0;
+    int forcedRoot = -1, lockedRoot = -1;
     std::vector<float> keyTuning;
     std::vector<KeyFinder::WeightedNote> keyNotes;
+
+    bool held[128] {};
+    std::vector<ChordEntry> chordLog;
+    i64 chordMask = 0, numChords = 0;
+
+    uint32_t currentSig = 0;
 
     std::vector<Mark> marks;
     i64 markMask = 0, numMarks = 0;

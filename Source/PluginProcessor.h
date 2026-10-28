@@ -19,7 +19,7 @@ public:
     bool hasEditor() const override { return true; }
 
     const juce::String getName() const override { return JucePlugin_Name; }
-    bool acceptsMidi() const override { return false; }
+    bool acceptsMidi() const override { return true; }   // chords for the chord / MIDI-notes harmony modes
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 0.5; }
@@ -37,12 +37,14 @@ public:
     HarmonyEngine engine;
 
 private:
-    struct VoicePtrs { std::atomic<float> *interval, *level, *pan, *delay, *formant; };
+    struct VoicePtrs { std::atomic<float> *interval, *level, *pan, *delay, *formant, *position, *motion; };
     VoicePtrs vp[3] {};
-    std::atomic<float> *key, *lookahead, *voices, *stack, *stackDetune, *stackWidth, *entryLag, *humanize, *autoFormant,
-                       *tightness, *minNote, *vibDepth, *vibRate, *vibDelay, *consonants, *dry, *wet;
+    std::atomic<float> *key, *mode, *keyLock, *harmony, *singOn, *longNote, *lookahead, *voices, *stack, *stackDetune,
+                       *stackWidth, *entryLag, *humanize, *autoFormant, *tightness, *minNote, *vibDepth, *vibRate, *vibDelay,
+                       *consonants, *dry, *wet;
 
     HarmonySettings snapshot() const;
+    std::vector<HarmonyEngine::MidiEvent> midiEvents;
 
     int currentLookahead = -1;
     double currentSampleRate = 0.0;
