@@ -460,21 +460,36 @@ void HarmonyEngine::segmentNotes (int64_t j, const Frame& f)
                 }
                 if (devRun >= changeFrames)
                 {
-                    closeNote (devStart);
-                    openNote (devStart, devMidi);
+                    if ((double) (devStart - n.start) < 0.2 * sr && std::abs (devMidi - n.midi) < 1.0f)
+                    {
+                        // a scoop or grace into the note, settling within a semitone: the same note,
+                        // re-centred on where it settled (start kept), not a new one
+                        n.midi = devMidi;
+                        n.pitches[0] = devMidi;
+                        n.numPitches = 1;
+                    }
+                    else
+                    {
+                        closeNote (devStart);
+                        openNote (devStart, devMidi);
+                    }
                     devRun = 0;
                 }
             }
             else
             {
                 devRun = 0;
-                if (n.numPitches < 32)
+                if (n.numPitches < Note::maxPitches)
                 {
                     n.pitches[n.numPitches++] = f.midi;
-                    float tmp[32];
-                    std::copy (n.pitches, n.pitches + n.numPitches, tmp);
-                    std::nth_element (tmp, tmp + n.numPitches / 2, tmp + n.numPitches);
-                    n.midi = tmp[n.numPitches / 2];
+
+                    // the note's pitch: median of the settled part (the attack, often a scoop, left out)
+                    float tmp[Note::maxPitches];
+                    const int skip = std::min (n.numPitches / 4, (int) (0.2 * sr / hop));
+                    const int count = n.numPitches - skip;
+                    std::copy (n.pitches + skip, n.pitches + n.numPitches, tmp);
+                    std::nth_element (tmp, tmp + count / 2, tmp + count);
+                    n.midi = tmp[count / 2];
                 }
             }
         }
@@ -738,28 +753,98 @@ const HarmonyEngine::ChordEntry* HarmonyEngine::midiChordAt (double t) const
     return found >= 0 ? &chordLog[(size_t) (found & chordMask)] : nullptr;
 }
 
+void HarmonyEngine::toneSpan (int64_t noteIdx, int64_t& first, int64_t& last) const
+{
+    // A held tone often reaches the note tracker as several pieces: a scoop into the note, the note,
+    // a wobble at its end. Neighbours with no real gap, sung within 0.6 semitones of the tone's
+    // longest piece, belong to the same tone.
+    constexpr double maxGap = 0.05;
+    constexpr float maxDiff = 0.6f;
+    first = last = noteIdx;
+    float anchor = note (noteIdx).midi;
+    i64 longest = noteEnd (note (noteIdx)) - note (noteIdx).start;
+
+    auto absorb = [&] (int64_t j) {
+        const auto len = noteEnd (note (j)) - note (j).start;
+        if (len > longest)
+        {
+            longest = len;
+            anchor = note (j).midi;
+        }
+    };
+    while (noteValid (first - 1) && (double) (note (first).start - noteEnd (note (first - 1))) < maxGap * sr
+           && std::abs (note (first - 1).midi - anchor) < maxDiff)
+        absorb (--first);
+    while (noteValid (last + 1) && (double) (note (last + 1).start - noteEnd (note (last))) < maxGap * sr
+           && std::abs (note (last + 1).midi - anchor) < maxDiff)
+        absorb (++last);
+}
+
 bool HarmonyEngine::noteSings (int64_t noteIdx, double t, const HarmonySettings& s) const
 {
-    const auto& n = note (noteIdx);
+    if (s.singOn == SingModes::All)
+        return true;
+
+    // judged on the whole held tone, not on a fragment of it
+    int64_t first = 0, last = 0;
+    toneSpan (noteIdx, first, last);
+    const double start = (double) note (first).start, end = (double) noteEnd (note (last));
+
+    // once a tone is sung it stays sung to its end, so a later change of mind can't cut it off
+    const uint32_t latch = (uint32_t) s.singOn * 100000u + (uint32_t) std::lround (s.longNoteMs) + 1u;
+    if (note (first).singLatch == latch)
+        return true;
+
+    bool sings = true;
     switch (s.singOn)
     {
         case SingModes::LongNotes:
-            // with lookahead the length is known before the note starts; live, the voice fades in once it is long enough
-            return (double) (noteEnd (n) - n.start) >= s.longNoteMs * 0.001 * sr
-                   && (! live || t - (double) n.start >= s.longNoteMs * 0.001 * sr);
+            // with lookahead the length is known before the tone starts; live, the voice fades in once it is long enough
+            sings = end - start >= s.longNoteMs * 0.001 * sr && (! live || t - start >= s.longNoteMs * 0.001 * sr);
+            break;
 
         case SingModes::PhraseEnds:
-        {
-            if (live)
-                return true;   // needs the future
-            if (n.end < 0)
-                return false;
-            const double gap = noteValid (noteIdx + 1) ? (double) (note (noteIdx + 1).start - n.end) : (double) (analysedUpTo - n.end);
-            return gap >= 0.25 * sr;
-        }
+            sings = live || isPhraseEnd (first, last);   // live: needs the future, so sing everything
+            break;
 
         default:
+            break;
+    }
+
+    if (sings)
+        note (first).singLatch = latch;
+    return sings;
+}
+
+bool HarmonyEngine::isPhraseEnd (int64_t first, int64_t last) const
+{
+    // The phrase's last held tone: what follows before the next pause (250 ms) is at most a quick
+    // syllable or two (each under 250 ms), which the backing voices let go.
+    const double minTone = 0.25 * sr, pause = 0.25 * sr;
+    const double start = (double) note (first).start, end = (double) noteEnd (note (last));
+
+    // When the lookahead can't see far enough to tell (the tone is still sounding at its edge, or
+    // has only just stopped), a long held tone is taken as the phrase end now, rather than finding
+    // out and entering halfway through it. Short tones wait for the facts.
+    const bool heldTone = end - start >= std::min (0.5 * sr, 0.6 * latency);
+    if (note (last).end < 0)
+        return heldTone;
+    if (end - start < minTone)
+        return false;
+
+    double prevEnd = end;
+    for (int64_t j = last + 1;; )
+    {
+        if (! noteValid (j))   // nothing sung since: a pause once long enough to tell, or a guess for a held tone
+            return (double) analysedUpTo - prevEnd >= pause || heldTone;
+        if ((double) note (j).start - prevEnd >= pause)
             return true;
+        int64_t f2 = 0, l2 = 0;
+        toneSpan (j, f2, l2);
+        if (note (l2).end < 0 || (double) (noteEnd (note (l2)) - note (f2).start) >= minTone)
+            return false;   // a real tone follows in the same phrase
+        prevEnd = (double) noteEnd (note (l2));
+        j = l2 + 1;
     }
 }
 
@@ -1155,13 +1240,28 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
         float shiftTarget = x.shift, vib = 0.0f, det = 0.0f;
         if (use >= 0)
             harmonize (use, s);
-        // this voice rests on this note (Sing On, or fewer MIDI notes held than voices); with lookahead
-        // it also starts fading just before a note it won't sing, so nothing leaks into that note
-        const int64_t upcoming = live ? use : noteIndexAt (tr + 0.03 * sr);
-        if (use >= 0 && ! (note (use).voiceOn[v] && noteSings (use, tr, s)))
-            gate = 0.0f;
-        else if (upcoming > use && noteValid (upcoming) && ! noteSings (upcoming, tr + 0.03 * sr, s))
-            gate = 0.0f;
+        // Sing On is decided on the voice's own timeline (u), not on the audio it re-reads while
+        // entering late, or a voice would flicker on the tail of a note it doesn't sing. With
+        // lookahead it also starts fading just before a note it won't sing.
+        bool sings = true;
+        if (s.singOn != SingModes::All)
+        {
+            auto around = [this] (double t) -> int64_t {
+                const int64_t at = noteIndexAt (t);
+                if (at >= 0 && (note (at).end < 0 || t < (double) note (at).end))
+                    return at;
+                if (noteValid (at + 1) && (double) note (at + 1).start - t < 0.03 * sr)
+                    return at + 1;
+                if (at >= 0 && t - (double) noteEnd (note (at)) < 0.06 * sr)
+                    return at;
+                return -1;
+            };
+            const int64_t now = around (u), soon = live ? now : around (u + 0.03 * sr);
+            sings = now >= 0 && noteSings (now, u, s) && (soon < 0 || soon == now || noteSings (soon, u + 0.03 * sr, s));
+        }
+
+        if (use >= 0 && ! (note (use).voiceOn[v] && sings))
+            gate = 0.0f;   // this voice rests here (Sing On, or fewer MIDI notes held than voices)
         else if (use >= 0)
         {
             const auto& n = note (use);

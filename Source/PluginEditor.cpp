@@ -181,7 +181,12 @@ void ChoirvoyantEditor::timerCallback()
         for (auto* k : voiceKnobs[v])
             k->setAlpha (alpha);
     }
-    longNote->setAlpha (intParam (proc.state, Params::singOn) == SingModes::LongNotes ? 1.0f : 0.35f);
+    const int sing = intParam (proc.state, Params::singOn);
+    longNote->setAlpha (sing == SingModes::LongNotes ? 1.0f : 0.35f);
+    // Phrase Ends needs to see the pause after a phrase's last note, which 1 s of lookahead often can't
+    const bool phraseHint = sing == SingModes::PhraseEnds && intParam (proc.state, Params::lookahead) < 4;
+    singOn->label.setText (phraseHint ? "Sing On  (best with 2 s)" : "Sing On", juce::dontSendNotification);
+    singOn->label.setColour (juce::Label::textColourId, phraseHint ? accent : dim);
     character[0]->setAlpha (live ? 0.35f : 1.0f);   // Entry Lag and Min Note need the lookahead
     character[4]->setAlpha (live ? 0.35f : 1.0f);
     mode->setAlpha (1.0f);

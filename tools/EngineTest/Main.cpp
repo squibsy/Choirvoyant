@@ -13,7 +13,13 @@ namespace
     constexpr double sr = 48000.0;
     constexpr double pi = 3.14159265358979323846;
 
-    struct SungNote { int midi; double start, dur; bool sibilantBefore; };
+    struct SungNote
+    {
+        int midi;
+        double start, dur;
+        bool sibilantBefore;
+        double settleSemis = 0.0, settleSec = 0.0;   // start this far off pitch for this long, then settle (a sung scoop)
+    };
 
     // Additive "ah" vowel with vibrato, scoops and sibilants between some notes.
     std::vector<float> synthVocal (const std::vector<SungNote>& melody, double totalSec)
@@ -41,7 +47,8 @@ namespace
                 const double t = (double) i / sr;
                 const double scoop = -0.6 * std::exp (-t / 0.04);
                 const double vibEnv = juce::jlimit (0.0, 1.0, (t - 0.15) / 0.2);
-                const double midi = n.midi + scoop + 0.3 * vibEnv * std::sin (2.0 * pi * 5.2 * t);
+                const double settle = t < n.settleSec ? n.settleSemis : n.settleSemis * std::exp (-(t - n.settleSec) / 0.015);
+                const double midi = n.midi + scoop + settle + 0.3 * vibEnv * std::sin (2.0 * pi * 5.2 * t);
                 const double f0 = 440.0 * std::pow (2.0, (midi - 69.0) / 12.0);
                 phase += 2.0 * pi * f0 / sr;
 
@@ -431,6 +438,82 @@ namespace
                 ++failures;
         }
 
+        // ---- Sing On with sung scoops, entry lag and phrases: each tone sung from its start, or not at all ----
+        {
+            // three phrases; '*' tones start 0.6 st sharp for 150 ms (the tracker splits these into two notes)
+            struct Tone { int midi; double dur; bool scoop, longNote, phraseEnd; };
+            const std::vector<std::vector<Tone>> phrases = {
+                { { 67, 0.3, false, false, false }, { 69, 0.3, false, false, false }, { 71, 0.7, true, true, false },
+                  { 72, 0.25, false, false, false }, { 74, 0.9, true, true, true } },
+                { { 72, 0.3, false, false, false }, { 71, 0.3, false, false, false }, { 69, 1.3, true, true, true } },
+                { { 67, 0.3, false, false, false }, { 69, 0.6, true, true, true }, { 67, 0.15, false, false, false } },
+            };
+            std::vector<SungNote> m;
+            std::vector<Tone> tones;
+            double t = 0.3;
+            for (const auto& p : phrases)
+            {
+                for (const auto& tone : p)
+                {
+                    SungNote n { tone.midi, t, tone.dur, false };
+                    if (tone.scoop)
+                    {
+                        n.settleSemis = 0.6;
+                        n.settleSec = 0.15;
+                    }
+                    m.push_back (n);
+                    tones.push_back (tone);
+                    t += tone.dur + 0.04;
+                }
+                t += 0.6;   // pause between phrases
+            }
+            const auto v = synthVocal (m, t + 0.5);
+
+            auto run = [&] (int mode, double lookahead, const char* label) {
+                auto s = plainVoices (1);
+                s.harmonyMode = HarmonyModes::ChordsAuto;
+                s.singOn = mode;
+                s.longNoteMs = 400.0f;
+                s.entryLagMs = 25.0f;   // realistic: voices re-read the previous note while entering
+                s.humanize = 0.3f;
+                NoteList notes;
+                const auto out = runEngine (v, s, lookahead, nullptr, nullptr, nullptr, &notes);
+                if (std::getenv ("CHV_DEBUG") != nullptr)
+                    for (const auto& n : notes)
+                        std::printf ("    note %.2f-%.2f  %.2f\n", n.start, n.end, n.midi);
+
+                int wrong = 0;
+                std::printf ("%s:", label);
+                for (size_t i = 0; i < m.size(); ++i)
+                {
+                    const bool want = mode == SingModes::LongNotes ? tones[i].longNote : tones[i].phraseEnd;
+                    // from just after the entry lag to just before the end, and separately the first 150 ms
+                    const int a = (int) ((m[i].start + 0.07) * sr), b = (int) ((m[i].start + m[i].dur - 0.05) * sr);
+                    const int c = (int) ((m[i].start + 0.07) * sr), d = (int) ((m[i].start + 0.22) * sr);
+                    auto energy = [&] (const float* x, int from, int to) {
+                        double e = 0.0;
+                        for (int k = from; k < to; ++k)
+                            e += (double) x[k] * x[k];
+                        return e / juce::jmax (1, to - from);
+                    };
+                    const double lead = energy (v.data(), a, b);
+                    const double body = energy (out.getReadPointer (0), a, b) / lead;
+                    const double head = energy (out.getReadPointer (0), c, juce::jmin (d, b)) / lead;
+                    const bool sung = body > 0.05, entered = head > 0.05, silent = body < 1e-4;
+                    const bool ok = want ? (sung && entered) : silent;
+                    wrong += ok ? 0 : 1;
+                    std::printf (" %s%s", want ? (entered ? "S" : "late") : (silent ? "-" : "leak"), ok ? "" : "*");
+                }
+                std::printf ("   (%d wrong)\n", wrong);
+                return wrong;
+            };
+            int wrong = run (SingModes::LongNotes, 1.0, "long notes, 1 s  ");
+            wrong += run (SingModes::PhraseEnds, 2.0, "phrase ends, 2 s ");
+            wrong += run (SingModes::PhraseEnds, 1.0, "phrase ends, 1 s ");
+            if (wrong > 0)
+                ++failures;
+        }
+
         // ---- live mode ----
         {
             double total = 0.0;
@@ -501,7 +584,11 @@ namespace
                 s.consonants = 0.0f;
 
                 int detected = -1;
-                const auto out = runEngine (vocal, s, 1.0, nullptr, &detected);
+                NoteList dbgNotes;
+                const auto out = runEngine (vocal, s, 1.0, nullptr, &detected, nullptr, &dbgNotes);
+                if (std::getenv ("CHV_DEBUG") != nullptr && ! dbgNotes.empty())
+                    std::printf ("    first note %.2f-%.2f midi %.2f grid %.2f name %d target %.1f\n", dbgNotes[0].start, dbgNotes[0].end,
+                                 dbgNotes[0].midi, dbgNotes[0].tuning, dbgNotes[0].name, dbgNotes[0].target[0]);
                 std::printf ("transpose %+d  %-9s  key %s (expected %s)\n", transpose, Intervals::name (interval),
                              detected >= 0 ? noteName (detected) : "?", noteName (root));
                 if (detected != root)
@@ -513,6 +600,8 @@ namespace
                     const auto& n = melody[i];
                     if (n.dur < 0.1)
                         continue;   // passing note holds the previous harmony note by design
+                    if (i == 0)
+                        continue;   // warm-up: with 1 s of lookahead the opening notes (e.g. D, E) fit more than one key
                     const int a = (int) ((n.start + 0.08) * sr), b = (int) ((n.start + n.dur - 0.04) * sr);
                     const float got = medianPitch (out.getReadPointer (0) + a, b - a);
                     const int want = diatonicUp (n.midi, root, Intervals::steps (interval));
@@ -624,6 +713,203 @@ namespace
 
         std::printf (failures == 0 ? "\nALL CHECKS PASSED\n" : "\n%d FAILURES\n", failures);
         return failures == 0 ? 0 : 1;
+    }
+
+    bool loadMono (const juce::File& file, std::vector<float>& mono, double& rate)
+    {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (file));
+        if (reader == nullptr)
+            return false;
+        rate = reader->sampleRate;
+        juce::AudioBuffer<float> buf ((int) reader->numChannels, (int) reader->lengthInSamples);
+        reader->read (&buf, 0, buf.getNumSamples(), 0, true, true);
+        mono.assign ((size_t) buf.getNumSamples(), 0.0f);
+        for (int c = 0; c < buf.getNumChannels(); ++c)
+            for (int i = 0; i < buf.getNumSamples(); ++i)
+                mono[(size_t) i] += buf.getSample (c, i) / (float) buf.getNumChannels();
+        return true;
+    }
+
+    // harmony only (left channel), aligned with the input
+    std::vector<float> renderAt (const std::vector<float>& mono, double rate, const HarmonySettings& s)
+    {
+        HarmonyEngine engine;
+        const char* la = std::getenv ("CHV_LOOKAHEAD");   // seconds, 0 = live
+        engine.prepare (rate, la != nullptr ? std::atof (la) : 1.0);
+        const int lat = engine.getLatencySamples(), total = (int) mono.size() + lat;
+        std::vector<float> in ((size_t) total, 0.0f), l ((size_t) total), r ((size_t) total);
+        std::copy (mono.begin(), mono.end(), in.begin());
+        for (int pos = 0; pos < total; pos += 512)
+        {
+            const int n = juce::jmin (512, total - pos);
+            const float* ins[1] = { in.data() + pos };
+            float* outs[2] = { l.data() + pos, r.data() + pos };
+            engine.process (ins, 1, outs, 2, n, s);
+        }
+        std::vector<float> outL ((size_t) mono.size()), outR ((size_t) mono.size());
+        for (size_t i = 0; i < mono.size(); ++i)
+            outL[i] = 0.5f * (l[i + (size_t) lat] + r[i + (size_t) lat]);
+        return outL;
+    }
+
+    // What actually sounds: for every 10 ms where the lead and one harmony voice are both clearly
+    // pitched, the interval between them (rounded, and its tuning error) and how clean the voice is.
+    int analyzeFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+
+        int len = 1;
+        while (len < rate * 0.042)
+            len <<= 1;
+        PitchTracker pt;
+        pt.prepare (rate, len, 60.0f, 1500.0f);
+        const int step = (int) (rate * 0.01);
+
+        struct Variant { const char* name; int mode, position, interval; float formant; };
+        const Variant variants[] = {
+            { "chords, voice above", HarmonyModes::ChordsAuto, Positions::Above, 2, 0.3f },
+            { "chords, voice below", HarmonyModes::ChordsAuto, Positions::Below, 2, 0.3f },
+            { "intervals, 3rd up  ", HarmonyModes::Intervals, Positions::Above, 2, 0.3f },
+            { "intervals, 3rd up, formant 0", HarmonyModes::Intervals, Positions::Above, 2, 0.0f },
+        };
+        static const char* names[12] = { "P1/P8", "m2", "M2", "m3", "M3", "P4", "TT", "P5", "m6", "M6", "m7", "M7" };
+
+        std::printf ("%s (%.0f Hz)\n", file.getFileName().toRawUTF8(), rate);
+
+        // null test: a unison voice with no formant shift should give back the input
+        {
+            HarmonySettings s;
+            s.harmonyMode = HarmonyModes::Intervals;
+            s.voices = 1;
+            s.voice[0].interval = 0;
+            s.voice[0].levelDb = 0.0f;
+            s.voice[0].pan = 0.0f;
+            s.autoFormant = 0.0f;
+            s.dryDb = -60.0f;
+            s.entryLagMs = s.humanize = s.vibDepthCents = s.consonants = s.minNoteMs = 0.0f;
+            const auto h = renderAt (mono, rate, s);
+            double sig = 0.0, err = 0.0;
+            for (size_t i = 0; i < mono.size(); ++i)
+                if (std::abs (mono[i]) > 1e-4f)
+                {
+                    sig += (double) mono[i] * mono[i];
+                    const double e = h[i] - mono[i];
+                    err += e * e;
+                }
+            std::printf ("  unison null test: input vs output %.1f dB SNR (above 20 dB = near-transparent)\n", 10.0 * std::log10 (sig / (err + 1e-12)));
+        }
+
+        for (const auto& var : variants)
+        {
+            HarmonySettings s;
+            s.harmonyMode = var.mode;
+            s.voices = 1;
+            s.voice[0].position = var.position;
+            s.voice[0].interval = var.interval;
+            s.voice[0].levelDb = 0.0f;
+            s.autoFormant = var.formant;
+            s.dryDb = -60.0f;
+            s.entryLagMs = s.humanize = s.vibDepthCents = s.consonants = 0.0f;
+            const auto h = renderAt (mono, rate, s);
+
+            int hist[12] {}, both = 0, leadVoiced = 0, rough = 0;
+            double centsErr = 0.0, leadAp = 0.0, harmAp = 0.0;
+            for (int p = 0; p + len <= (int) mono.size(); p += step)
+            {
+                const auto a = pt.analyse (mono.data() + p);
+                if (! (a.f0 > 0.0f && a.aperiodicity < 0.15f && a.rms > 0.01f))
+                    continue;
+                ++leadVoiced;
+                const auto b = pt.analyse (h.data() + p);
+                if (! (b.f0 > 0.0f && b.aperiodicity < 0.2f))
+                {
+                    ++rough;
+                    continue;
+                }
+                ++both;
+                leadAp += a.aperiodicity;
+                harmAp += b.aperiodicity;
+                const double iv = 12.0 * std::log2 (b.f0 / a.f0);
+                const int ri = (int) std::lround (iv);
+                hist[((ri % 12) + 12) % 12]++;
+                centsErr += std::abs (iv - ri) * 100.0;
+            }
+            std::printf ("  %-30s rough/unpitched %4.1f%%  interval error %4.1f ct  aperiodicity lead %.3f harmony %.3f\n    ", var.name,
+                         100.0 * rough / juce::jmax (1, leadVoiced), centsErr / juce::jmax (1, both), leadAp / juce::jmax (1, both),
+                         harmAp / juce::jmax (1, both));
+            for (int k = 0; k < 12; ++k)
+                if (hist[k] * 100 >= both)   // show intervals heard at least 1% of the time
+                    std::printf ("%s %d%%  ", names[k], hist[k] * 100 / juce::jmax (1, both));
+            std::printf ("\n");
+        }
+        return 0;
+    }
+
+    // When does the harmony actually sound in Sing On: Long Notes? Prints each stretch where
+    // voice 1 is audible, next to the sung notes.
+    int gatesFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+
+        HarmonySettings s;
+        s.voices = 1;
+        s.voice[0].levelDb = 0.0f;
+        s.dryDb = -60.0f;
+        s.singOn = SingModes::LongNotes;
+        s.consonants = 0.0f;
+        if (const char* t = std::getenv ("CHV_LONG"))
+            s.longNoteMs = (float) std::atof (t);
+        if (std::getenv ("CHV_PHRASE") != nullptr)
+            s.singOn = SingModes::PhraseEnds;
+        if (std::getenv ("CHV_NOLAG") != nullptr)
+            s.entryLagMs = s.humanize = 0.0f;
+        const auto h = renderAt (mono, rate, s);
+
+        // reference: the lead's average loudness while singing
+        const int step = (int) (rate * 0.02);
+        double leadSum = 0.0;
+        int leadFrames = 0;
+        for (int p = 0; p + step <= (int) mono.size(); p += step)
+        {
+            double el = 0.0;
+            for (int k = p; k < p + step; ++k)
+                el += (double) mono[(size_t) k] * mono[(size_t) k];
+            if (el > 1e-5 * step)
+            {
+                leadSum += el;
+                ++leadFrames;
+            }
+        }
+        const double leadRef = leadSum / juce::jmax (1, leadFrames);
+
+        bool on = false;
+        double since = 0.0;
+        std::printf ("harmony audible (%s):\n", s.singOn == SingModes::PhraseEnds ? "phrase ends"
+                                                  : juce::String::formatted ("long notes >= %.0f ms", s.longNoteMs).toRawUTF8());
+        for (int p = 0; p + step <= (int) mono.size(); p += step)
+        {
+            double eh = 0.0;
+            for (int k = p; k < p + step; ++k)
+                eh += (double) h[(size_t) k] * h[(size_t) k];
+            const bool now = eh > 0.01 * leadRef;   // within 20 dB of the lead's average level
+            if (now != on)
+            {
+                const double t = p / rate;
+                if (on)
+                    std::printf ("  %6.2f - %6.2f s  (%.2f s)\n", since, t, t - since);
+                on = now;
+                since = t;
+            }
+        }
+        return 0;
     }
 
     int harmonizeFile (const juce::File& file)
@@ -893,6 +1179,10 @@ int main (int argc, char** argv)
    #endif
     for (int i = 1; i + 1 < argc; ++i)
     {
+        if (juce::String (argv[i]) == "--gates")
+            return gatesFile (juce::File (juce::String (argv[i + 1])));
+        if (juce::String (argv[i]) == "--analyze")
+            return analyzeFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--in")
             return harmonizeFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--vst3")

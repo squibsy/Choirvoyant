@@ -194,10 +194,12 @@ private:
 
     struct Note
     {
+        static constexpr int maxPitches = 256;   // ~1.4 s of frames at 48 kHz; longer notes keep their first part
+
         i64 start = 0, end = -1;            // end = -1 while the note is still sounding at the input
-        float midi = 0.0f;
+        float midi = 0.0f;                  // the note's pitch: median of its settled part
         float tuning = 0.0f;                // singer's tuning grid (offset from A440, semitones) the note was named on
-        float pitches[32] {};
+        float pitches[maxPitches] {};
         int numPitches = 0;
 
         // harmony for all voices, cached the first time any voice reads this note
@@ -208,6 +210,9 @@ private:
         float target[3] {};                 // harmony notes on the singer's grid
         int leadRef[3] {};                  // note the lead was heard as, per voice
         bool voiceOn[3] {};
+
+        // Sing On: once a held tone starting at this note is sung, it is sung to its end
+        mutable uint32_t singLatch = 0;     // settings it was latched with, 0 = not latched
 
         // per instance: entry timing, cached when the instance reaches this note
         bool entryDone[maxInstances] {};
@@ -264,6 +269,8 @@ private:
     void voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, const HarmonySettings& s,
                      float out[3]) const;
     bool noteSings (i64 noteIdx, double t, const HarmonySettings& s) const;
+    void toneSpan (i64 noteIdx, i64& first, i64& last) const;
+    bool isPhraseEnd (i64 first, i64 last) const;
     static uint32_t signature (const HarmonySettings& s, bool live);
 
     // ---- synthesis ----
