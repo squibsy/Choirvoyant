@@ -36,13 +36,28 @@ knowing what comes next. A live mode cuts the latency to 30 ms for stage use.
 
 | Section | Controls |
 |---|---|
-| Header | Key (Auto or a tonic), Mode (Auto / Major / Minor), Lookahead (Live 30 ms, 250 ms to 2 s), Key Lock, and a live readout of key, tuning offset, chord, lead and harmony notes |
-| Voice 1-3 | Chord modes: Position (Above, Above Wide, Below, Below Wide, Bass) and Motion (Follow, Hold, Contrary). Intervals mode: Interval. Always: Level, Pan, Delay, Formant offset |
+| Header | Key (Auto or a tonic), Mode (Auto / Major / Minor), Lookahead (Live 30 ms, 250 ms to 2 s), Source (Voice / Instrument), Key Lock, and a live readout of key, tuning offset, chord, lead and harmony notes |
+| Voice 1-3 | Chord modes: Position (Above, Above Wide, Below, Below Wide, Bass) and Motion (Follow, Hold, Contrary). Intervals mode: Interval. Always: Level, Pan, Delay, Formant offset, Mute / Solo |
 | Character | Entry Lag (late entry that catches up before the note ends), Humanize (timing and pitch drift), Auto Formant, Tightness (0 = follow the singer's inflections, 100% = harmonies exactly in tune), Min Note, Consonants (pulls sibilants and breaths out of the harmonies) |
 | Harmony | Harmony mode, Sing On (All Notes, Long Notes, Phrase Ends), Long Note threshold |
 | Vibrato | Depth, Rate, Delay. Only on notes long enough to carry it, out of phase between voices |
 | Stack | Copies per voice (1-3), Detune, Width |
-| Mix | Voices (1-3), Dry, Harmony |
+| Double | Level (Off by default), Detune, Rate, Delay, Width, Mute / Solo |
+| Mix | Voices (1-3), Dry, Harmony, and Mute / Solo for the dry signal |
+
+**Source**: *Voice* (default) or *Instrument*. Instrument switches off everything that only
+suits a singer: Entry Lag (on a picked note it smears a short slide into every attack),
+Humanize, Consonants (pick attacks would be softened like sibilants), formant shift and added
+vibrato. It also tracks down to 30 Hz (bass guitar, baritone; not in Live mode), and choosing
+it in the editor moves Harmony from Chords (Auto) to Intervals, the classic twin-lead sound.
+Switching Source restarts the analysis, like changing the lookahead.
+
+**Double** thickens the lead itself: two copies, one each side, slowly detuned by LFOs moving
+in opposite directions and slightly delayed (the left copy by Delay, the right by 62% of it),
+like a double-tracked vocal. It's independent of the harmony voices.
+
+**Mute / Solo** (M / S on each voice, on Double, and for the dry signal in MIX): a muted source
+is silent; while anything is soloed, only soloed sources play.
 
 **Motion**: *Follow* voice-leads with the lead; *Hold* keeps its note while it still fits
 the chord (sustained "ooh" lines); *Contrary* prefers moving against the lead.

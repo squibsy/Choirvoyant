@@ -78,6 +78,7 @@ struct VoiceSettings
     float formantSemis = 0.0f;  // manual offset on top of the automatic amount
     int position = Positions::Above;    // chord modes
     int motion = Motions::Follow;
+    bool mute = false, solo = false;
 };
 
 struct HarmonySettings
@@ -88,6 +89,22 @@ struct HarmonySettings
 
     int harmonyMode = HarmonyModes::ChordsAuto;
     int singOn = SingModes::All;
+
+    // Instrument source: switches off what only suits a singer (late entry, humanized timing and
+    // pitch, consonant softening, formant shift, added vibrato). On a picked or plucked note the
+    // late entry would smear a short slide into every attack.
+    bool instrument = false;
+
+    // Double: two copies of the lead itself, one each side, slowly detuned by LFOs moving in
+    // opposite directions and slightly delayed, to thicken it like a double-tracked vocal
+    float doubleDb = -60.0f;    // -60 = off
+    float doubleDetuneCents = 8.0f;
+    float doubleRateHz = 0.4f;
+    float doubleDelayMs = 18.0f;
+    float doubleWidth = 0.8f;   // 0..1
+
+    // mute / solo: a muted source is silent; while anything is soloed, only soloed sources play
+    bool dryMute = false, drySolo = false, doubleMute = false, doubleSolo = false;
     float longNoteMs = 400.0f;
 
     int voices = 2;             // 1..3
@@ -124,7 +141,8 @@ class HarmonyEngine
 public:
     static constexpr double maxLookaheadSeconds = 2.0;
     static constexpr double liveLatencySeconds = 0.03;
-    static constexpr int maxInstances = 9;   // 3 voices x 3 stack copies
+    static constexpr int firstDoubler = 9;   // 3 voices x 3 stack copies, then the two doubles
+    static constexpr int maxInstances = 11;
 
     struct MidiEvent
     {
@@ -265,11 +283,12 @@ private:
 
     // ---- harmony ----
     void harmonize (i64 noteIdx, const HarmonySettings& s, int depth = 0);
-    int chooseDegree (i64 noteIdx, int prevDegree, const Chords::Chord chords[], float grid);
+    int chooseDegree (i64 noteIdx, int prevDegree, const Chords::Chord chords[], float grid, int majorRoot);
     void voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, const HarmonySettings& s,
                      float out[3]) const;
     bool noteSings (i64 noteIdx, double t, const HarmonySettings& s) const;
     void toneSpan (i64 noteIdx, i64& first, i64& last) const;
+    bool isGlide (const Note& n) const;
     bool isPhraseEnd (i64 first, i64 last) const;
     static uint32_t signature (const HarmonySettings& s, bool live);
 
@@ -280,13 +299,14 @@ private:
 
     double sr = 48000.0;
     int latency = 0, hop = 256, frameLen = 2048, maxHalf = 1024, medianRadius = 2, onsetFrames = 3;
-    bool live = false;
+    bool live = false, deep = false;
+    void configureAnalysis();
     float uvSpacing = 240.0f;
 
     std::vector<float> src, dryL, dryR, scratch;
     i64 srcMask = 0, head = 0;
 
-    PitchTracker trackerFull, trackerLive;
+    PitchTracker trackerFull, trackerDeep, trackerLive;   // voice, instrument (down to 30 Hz), live
     PitchTracker* tracker = &trackerFull;
     std::vector<Frame> rawFrames, frames;
     std::vector<int8_t> keyTrack;

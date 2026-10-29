@@ -540,6 +540,160 @@ namespace
                 ++failures;
         }
 
+        // ---- Instrument: a bass line down to E1 (41 Hz), 3rd up in E minor ----
+        {
+            const int line[] = { 28, 31, 33, 35, 31, 28, 35, 33 };   // E1 G1 A1 B1 G1 E1 B1 A1
+            std::vector<SungNote> m;
+            double t = 0.3;
+            for (int nn : line)
+            {
+                m.push_back ({ nn, t, 0.6, false });
+                t += 0.65;
+            }
+            const auto v = synthVocal (m, t + 0.5);
+            auto s = plainVoices (1);
+            s.instrument = true;
+            s.harmonyMode = HarmonyModes::Intervals;
+            s.voice[0].interval = 2;   // 3rd up
+            s.keyMode = 5;             // E
+            s.scaleMode = 2;           // minor
+            const auto out = runEngine (v, s, 1.0);
+
+            PitchTracker low;
+            low.prepare (sr, 8192, 25.0f, 600.0f);
+            int right = 0, checked = 0;
+            for (const auto& n : m)
+            {
+                const int a = (int) ((n.start + 0.1) * sr);
+                if (a + 8192 > out.getNumSamples())
+                    continue;
+                const auto r = low.analyse (out.getReadPointer (0) + a);
+                const float got = r.f0 > 0.0f ? 69.0f + 12.0f * std::log2 (r.f0 / 440.0f) : 0.0f;
+                ++checked;
+                right += std::abs (got - (float) diatonicUp (n.midi, 7, 2)) < 0.5f ? 1 : 0;   // E minor = G major scale
+            }
+            std::printf ("instrument bass line (E1-B1): 3rd up right on %d/%d notes\n", right, checked);
+            if (right != checked)
+                ++failures;
+        }
+
+        // ---- Double: two copies of the lead, detuned by LFOs, one each side ----
+        {
+            double total = 0.0;
+            const auto m = testMelody (0, total);
+            const auto v = synthVocal (m, total);
+            auto s = plainVoices (1);
+            s.voice[0].levelDb = -48.0f;   // harmony off: listen to the doubles only
+            s.doubleDb = 0.0f;
+            s.doubleDetuneCents = 10.0f;
+            s.doubleRateHz = 0.5f;
+            const auto out = runEngine (v, s, 1.0);
+
+            // per 50 ms, pitch of each side against the lead, over the long notes
+            PitchTracker pt;
+            pt.prepare (sr, 2048, 60.0f, 1500.0f);
+            std::vector<float> devL, devR;
+            double corrNum = 0.0, eL = 0.0, eR = 0.0;
+            for (const auto& n : m)
+            {
+                if (n.dur < 0.4)
+                    continue;
+                for (double at = n.start + 0.1; at + 0.05 < n.start + n.dur - 0.05; at += 0.05)
+                {
+                    const int a = (int) (at * sr);
+                    const auto lead = pt.analyse (v.data() + a);
+                    const auto l = pt.analyse (out.getReadPointer (0) + a);
+                    const auto r = pt.analyse (out.getReadPointer (1) + a);
+                    if (lead.f0 > 0 && l.f0 > 0 && r.f0 > 0)
+                    {
+                        devL.push_back (1200.0f * std::log2 (l.f0 / lead.f0));
+                        devR.push_back (1200.0f * std::log2 (r.f0 / lead.f0));
+                    }
+                }
+                for (int k = (int) (n.start * sr); k < (int) ((n.start + n.dur) * sr); ++k)
+                {
+                    corrNum += (double) out.getSample (0, k) * out.getSample (1, k);
+                    eL += (double) out.getSample (0, k) * out.getSample (0, k);
+                    eR += (double) out.getSample (1, k) * out.getSample (1, k);
+                }
+            }
+            auto range = [] (std::vector<float> d) {
+                std::sort (d.begin(), d.end());
+                return d.empty() ? 0.0f : d[d.size() * 9 / 10] - d[d.size() / 10];
+            };
+            auto meanAbs = [] (const std::vector<float>& d) {
+                double a = 0.0;
+                for (float x : d)
+                    a += std::abs (x);
+                return d.empty() ? 99.0 : a / (double) d.size();
+            };
+            const double corr = corrNum / std::sqrt (eL * eR + 1e-12);
+            std::printf ("double: left %.1f / right %.1f cents from the lead on average, swinging %.0f / %.0f cents; L/R correlation %.2f\n",
+                         meanAbs (devL), meanAbs (devR), range (devL), range (devR), corr);
+            // within the detune depth, actually moving, and the two sides different
+            if (meanAbs (devL) > 12.0 || meanAbs (devR) > 12.0 || range (devL) < 4.0f || range (devR) < 4.0f || corr > 0.95 || eL < 1e-6)
+                ++failures;
+        }
+
+        // ---- mute / solo ----
+        {
+            double total = 0.0;
+            const auto m = testMelody (0, total);
+            const auto v = synthVocal (m, total);
+            auto energy = [] (const juce::AudioBuffer<float>& b) {
+                double e = 0.0;
+                for (int k = 0; k < b.getNumSamples(); ++k)
+                    e += (double) b.getSample (0, k) * b.getSample (0, k);
+                return e;
+            };
+            // how much of the output isn't the dry input
+            auto harmonyLeft = [&] (const juce::AudioBuffer<float>& b) {
+                double e = 0.0;
+                for (int k = 0; k < b.getNumSamples(); ++k)
+                {
+                    const double d = b.getSample (0, k) - v[(size_t) k];
+                    e += d * d;
+                }
+                return e;
+            };
+            auto base = [] {
+                HarmonySettings s;
+                s.harmonyMode = HarmonyModes::Intervals;
+                s.voices = 2;
+                s.voice[0].pan = s.voice[1].pan = 0.0f;
+                return s;
+            };
+            const double dry = energy (runEngine (v, [&] { auto s = base(); s.voices = 1; s.voice[0].levelDb = -48.0f; return s; }(), 1.0));
+
+            auto s1 = base();
+            s1.voice[0].mute = s1.voice[1].mute = true;
+            const double mutedVoices = harmonyLeft (runEngine (v, s1, 1.0)) / dry;
+
+            auto s2 = base();
+            s2.drySolo = true;
+            const double drySoloed = harmonyLeft (runEngine (v, s2, 1.0)) / dry;
+
+            auto s3 = base();
+            s3.voice[1].solo = true;
+            const auto soloOut = runEngine (v, s3, 1.0);
+            auto s4 = base();
+            s4.dryMute = true;
+            s4.voice[0].mute = true;
+            const auto voice2Only = runEngine (v, s4, 1.0);
+            double diff = 0.0;
+            for (int k = 0; k < soloOut.getNumSamples(); ++k)
+            {
+                const double d = soloOut.getSample (0, k) - voice2Only.getSample (0, k);
+                diff += d * d;
+            }
+            const double soloMatches = diff / energy (voice2Only);
+
+            std::printf ("mute/solo: voices muted leaves %.0f dB of harmony, dry soloed %.0f dB, voice 2 soloed = dry and voice 1 muted to %.0f dB\n",
+                         10.0 * std::log10 (mutedVoices + 1e-12), 10.0 * std::log10 (drySoloed + 1e-12), 10.0 * std::log10 (soloMatches + 1e-12));
+            if (mutedVoices > 1e-4 || drySoloed > 1e-4 || soloMatches > 1e-3)
+                ++failures;
+        }
+
         // ---- full patch in chord mode: CPU and stability ----
         {
             auto s = plainVoices (3);
@@ -767,7 +921,7 @@ namespace
         while (len < rate * 0.042)
             len <<= 1;
         PitchTracker pt;
-        pt.prepare (rate, len, 60.0f, 1500.0f);
+        pt.prepare (rate, len, 60.0f, 1700.0f);
         const int step = (int) (rate * 0.01);
 
         struct Variant { const char* name; int mode, position, interval; float formant; };
@@ -846,6 +1000,104 @@ namespace
                 if (hist[k] * 100 >= both)   // show intervals heard at least 1% of the time
                     std::printf ("%s %d%%  ", names[k], hist[k] * 100 / juce::jmax (1, both));
             std::printf ("\n");
+        }
+        return 0;
+    }
+
+    // How long after each note starts does the lead, and the harmony, reach its settled pitch?
+    // A harmony that takes much longer than the lead smears ("meows") into every note.
+    int onsetsFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+
+        int len = 1;
+        while (len < rate * 0.03)
+            len <<= 1;
+        PitchTracker pt;
+        pt.prepare (rate, len, 60.0f, 1700.0f);
+        const int hop = (int) (rate * 0.005);
+        auto track = [&] (const std::vector<float>& x) {
+            std::vector<float> p;
+            for (int i = 0; i + len <= (int) x.size(); i += hop)
+            {
+                const auto r = pt.analyse (x.data() + i);
+                p.push_back (r.f0 > 0.0f && r.aperiodicity < 0.25f ? 69.0f + 12.0f * std::log2 (r.f0 / 440.0f) : 0.0f);
+            }
+            return p;
+        };
+        const auto lead = track (mono);
+
+        // note starts from the lead: a jump of more than 0.7 st that then holds for 60 ms, or voicing starting
+        std::vector<int> starts;
+        for (int i = 1; i + 12 < (int) lead.size(); ++i)
+        {
+            const bool jump = lead[(size_t) i] > 0 && (lead[(size_t) i - 1] == 0 || std::abs (lead[(size_t) i] - lead[(size_t) i - 1]) > 0.7f);
+            bool holds = jump;
+            for (int k = 1; k <= 12 && holds; ++k)
+                holds = lead[(size_t) (i + k)] > 0 && std::abs (lead[(size_t) (i + k)] - lead[(size_t) i]) < 0.7f;
+            if (holds && (starts.empty() || i - starts.back() > 20))
+                starts.push_back (i);
+        }
+
+        // settle time: until the pitch stays within 40 cents of its value 150-300 ms in
+        auto settleMs = [&] (const std::vector<float>& p, int s) {
+            std::vector<float> ref;
+            for (int k = s + 30; k < s + 60 && k < (int) p.size(); ++k)
+                if (p[(size_t) k] > 0)
+                    ref.push_back (p[(size_t) k]);
+            if (ref.size() < 10)
+                return -1.0;
+            std::sort (ref.begin(), ref.end());
+            const float target = ref[ref.size() / 2];
+            int last = s;
+            for (int k = s; k < s + 30 && k < (int) p.size(); ++k)
+                if (p[(size_t) k] == 0 || std::abs (p[(size_t) k] - target) > 0.4f)
+                    last = k + 1;
+            return (last - s) * 5.0;
+        };
+
+        std::printf ("%s: %zu note starts\n", file.getFileName().toRawUTF8(), starts.size());
+        for (int variant = 0; variant < 3; ++variant)
+        {
+            HarmonySettings s;
+            s.harmonyMode = HarmonyModes::Intervals;
+            s.voices = 1;
+            s.voice[0].interval = 2;
+            s.voice[0].levelDb = 0.0f;
+            s.dryDb = -60.0f;
+            s.autoFormant = s.consonants = s.vibDepthCents = 0.0f;
+            s.keyMode = 12;
+            s.scaleMode = 2;
+            const char* name = "default (entry lag 25 ms, humanize 30%)";
+            if (variant == 1)
+            {
+                s.entryLagMs = s.humanize = 0.0f;
+                name = "entry lag 0, humanize 0";
+            }
+            else if (variant == 2)
+            {
+                s.instrument = true;
+                name = "Source: Instrument";
+            }
+            const auto h = renderAt (mono, rate, s);
+            const auto harm = track (h);
+            double leadSum = 0.0, harmSum = 0.0;
+            int n = 0, slow = 0;
+            for (int st : starts)
+            {
+                const double a = settleMs (lead, st), b = settleMs (harm, st);
+                if (a < 0 || b < 0)
+                    continue;
+                leadSum += a;
+                harmSum += b;
+                slow += b > a + 30.0 ? 1 : 0;
+                ++n;
+            }
+            std::printf ("  %-40s lead settles in %5.1f ms, harmony in %5.1f ms; harmony >30 ms slower on %d/%d notes\n", name,
+                         leadSum / juce::jmax (1, n), harmSum / juce::jmax (1, n), slow, n);
         }
         return 0;
     }
@@ -942,7 +1194,7 @@ namespace
             PitchTracker pt;
             int len = 1;
             while (len < rate * 0.042) len <<= 1;
-            pt.prepare (rate, len, 70.0f, 1100.0f);
+            pt.prepare (rate, len, 70.0f, 1600.0f);
             const int step = (int) (rate * 0.1);
             for (int p = 0, k = 0; p + len <= (int) mono.size() && k < 300; p += step, ++k)
             {
@@ -957,8 +1209,21 @@ namespace
         for (int pass = 0; pass < 2; ++pass)
         {
             HarmonySettings s;
-            if (const char* k = std::getenv ("CHV_KEY"))   // 0 = auto, 1..12 = fixed scale on C..B
+            if (const char* k = std::getenv ("CHV_KEY"))   // 0 = auto, 1..12 = fixed tonic C..B
                 s.keyMode = std::atoi (k);
+            if (const char* k = std::getenv ("CHV_SCALE"))   // 0 = auto, 1 = major, 2 = minor
+                s.scaleMode = std::atoi (k);
+            if (const char* k = std::getenv ("CHV_HARMONY"))   // HarmonyModes index
+                s.harmonyMode = std::atoi (k);
+            if (const char* k = std::getenv ("CHV_VOICES"))
+                s.voices = std::atoi (k);
+            if (std::getenv ("CHV_INSTRUMENT") != nullptr)   // Source: Instrument
+                s.instrument = true;
+            if (const char* k = std::getenv ("CHV_DOUBLE"))   // Double level, dB
+                s.doubleDb = (float) std::atof (k);
+            if (std::getenv ("CHV_MUTEVOICES") != nullptr)
+                for (auto& v : s.voice)
+                    v.mute = true;
             if (pass == 1)
                 s.dryDb = -60.0f;
 
@@ -1179,6 +1444,8 @@ int main (int argc, char** argv)
    #endif
     for (int i = 1; i + 1 < argc; ++i)
     {
+        if (juce::String (argv[i]) == "--onsets")
+            return onsetsFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--gates")
             return gatesFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--analyze")

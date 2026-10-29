@@ -89,6 +89,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
         group->addChild (std::make_unique<APC> (pid (vid (v, interval)), n + "Interval", intervals, defInterval[v]));
         group->addChild (std::make_unique<APC> (pid (vid (v, position)), n + "Position", positions, defPosition[v]));
         group->addChild (std::make_unique<APC> (pid (vid (v, motion)), n + "Motion", motions, defMotion[v]));
+        group->addChild (std::make_unique<juce::AudioParameterBool> (pid (vid (v, mute)), n + "Mute", false));
+        group->addChild (std::make_unique<juce::AudioParameterBool> (pid (vid (v, solo)), n + "Solo", false));
         group->addChild (std::make_unique<APF> (pid (vid (v, level)), n + "Level", range (-48.0f, 6.0f, 0.1f), -4.0f, dbText (-47.9f, "Off")));
         group->addChild (std::make_unique<APF> (pid (vid (v, pan)), n + "Pan", range (-1.0f, 1.0f, 0.01f), defPan[v], panText()));
         group->addChild (std::make_unique<APF> (pid (vid (v, delay)), n + "Delay", skewed (0.0f, 250.0f, 40.0f), defDelay[v], msText()));
@@ -106,8 +108,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
                                              HarmonyModes::ChordsAuto));
     global->addChild (std::make_unique<APC> (pid (singOn), "Sing On", names (SingModes::count, SingModes::name), SingModes::All));
     global->addChild (std::make_unique<APF> (pid (longNote), "Long Note", skewed (150.0f, 1500.0f, 400.0f), 400.0f, msText()));
+    global->addChild (std::make_unique<APC> (pid (source), "Source", juce::StringArray { "Voice", "Instrument" }, 0));
     global->addChild (std::make_unique<API> (pid (voices), "Voices", 1, 3, 2));
     global->addChild (std::make_unique<APF> (pid (dry), "Dry", range (-60.0f, 6.0f, 0.1f), 0.0f, dbText (-59.9f, "Off")));
+    global->addChild (std::make_unique<juce::AudioParameterBool> (pid (dryMute), "Dry Mute", false));
+    global->addChild (std::make_unique<juce::AudioParameterBool> (pid (drySolo), "Dry Solo", false));
     global->addChild (std::make_unique<APF> (pid (wet), "Harmony", range (-60.0f, 6.0f, 0.1f), 0.0f, dbText (-59.9f, "Off")));
     layout.add (std::move (global));
 
@@ -127,6 +132,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
                                               withText ([] (float v) { return juce::String (v, 2) + " Hz"; })));
     vibrato->addChild (std::make_unique<APF> (pid (vibDelay), "Vibrato Delay", range (0.0f, 800.0f, 1.0f), 250.0f, msText()));
     layout.add (std::move (vibrato));
+
+    auto doubleGroup = std::make_unique<juce::AudioProcessorParameterGroup> ("double", "Double", "|");
+    doubleGroup->addChild (std::make_unique<APF> (pid (dbl), "Double", range (-60.0f, 0.0f, 0.1f), -60.0f, dbText (-59.9f, "Off")));
+    doubleGroup->addChild (std::make_unique<APF> (pid (dblDetune), "Double Detune", range (0.0f, 30.0f, 0.1f), 8.0f, centsText()));
+    doubleGroup->addChild (std::make_unique<APF> (pid (dblRate), "Double Rate", skewed (0.05f, 2.0f, 0.4f), 0.4f,
+                                                  withText ([] (float v) { return juce::String (v, 2) + " Hz"; })));
+    doubleGroup->addChild (std::make_unique<APF> (pid (dblDelay), "Double Delay", range (0.0f, 40.0f, 0.1f), 18.0f, msText()));
+    doubleGroup->addChild (std::make_unique<APF> (pid (dblWidth), "Double Width", range (0.0f, 1.0f, 0.01f), 0.8f, pctText()));
+    doubleGroup->addChild (std::make_unique<juce::AudioParameterBool> (pid (dblMute), "Double Mute", false));
+    doubleGroup->addChild (std::make_unique<juce::AudioParameterBool> (pid (dblSolo), "Double Solo", false));
+    layout.add (std::move (doubleGroup));
 
     auto stackGroup = std::make_unique<juce::AudioProcessorParameterGroup> ("stack", "Stack", "|");
     stackGroup->addChild (std::make_unique<API> (pid (stack), "Stack", 1, 3, 1));

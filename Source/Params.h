@@ -14,6 +14,8 @@ namespace Params
     constexpr const char* formant  = "formant";
     constexpr const char* position = "position";
     constexpr const char* motion   = "motion";
+    constexpr const char* mute     = "mute";
+    constexpr const char* solo     = "solo";
 
     // ---- Global ----
     constexpr const char* key         = "key";
@@ -23,6 +25,16 @@ namespace Params
     constexpr const char* harmony     = "harmony";
     constexpr const char* singOn      = "singon";
     constexpr const char* longNote    = "longnote";
+    constexpr const char* source      = "source";
+    constexpr const char* dbl         = "double";
+    constexpr const char* dblDetune   = "doubledetune";
+    constexpr const char* dblRate     = "doublerate";
+    constexpr const char* dblDelay    = "doubledelay";
+    constexpr const char* dblWidth    = "doublewidth";
+    constexpr const char* dryMute     = "drymute";
+    constexpr const char* drySolo     = "drysolo";
+    constexpr const char* dblMute     = "doublemute";
+    constexpr const char* dblSolo     = "doublesolo";
     constexpr const char* voices      = "voices";
     constexpr const char* stack       = "stack";
     constexpr const char* stackDetune = "stackdetune";

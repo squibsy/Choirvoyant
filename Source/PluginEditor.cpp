@@ -61,6 +61,30 @@ void ChoirvoyantEditor::Choice::resized()
     box.setBounds (r.removeFromTop (24));
 }
 
+ChoirvoyantEditor::MuteSolo::MuteSolo (juce::AudioProcessorValueTreeState& s, const juce::String& muteId, const juce::String& soloId)
+    : muteAttachment (s, muteId, mute), soloAttachment (s, soloId, solo)
+{
+    for (auto* b : { &mute, &solo })
+    {
+        b->setClickingTogglesState (true);
+        b->setColour (juce::TextButton::buttonColourId, panel.brighter (0.15f));
+        b->setColour (juce::TextButton::textColourOffId, dim);
+        b->setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+        addAndMakeVisible (b);
+    }
+    mute.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffe07a5f));
+    solo.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xfff2cc5c));
+    mute.setTooltip ("Mute");
+    solo.setTooltip ("Solo: while anything is soloed, only soloed sources play");
+}
+
+void ChoirvoyantEditor::MuteSolo::resized()
+{
+    auto r = getLocalBounds();
+    mute.setBounds (r.removeFromLeft (r.getWidth() / 2).reduced (1, 0));
+    solo.setBounds (r.reduced (1, 0));
+}
+
 //==============================================================================
 ChoirvoyantEditor::ChoirvoyantEditor (ChoirvoyantProcessor& p)
     : AudioProcessorEditor (p), proc (p), keyLockAttachment (p.state, Params::keyLock, keyLock)
@@ -74,6 +98,7 @@ ChoirvoyantEditor::ChoirvoyantEditor (ChoirvoyantProcessor& p)
     using namespace Params;
     key = &choice (Params::key, "Key");
     mode = &choice (Params::mode, "Mode");
+    source = &choice (Params::source, "Source");
     lookahead = &choice (Params::lookahead, "Lookahead");
     addAndMakeVisible (keyLock);
 
@@ -110,15 +135,42 @@ ChoirvoyantEditor::ChoirvoyantEditor (ChoirvoyantProcessor& p)
     stack[0] = &knob (Params::stack, "Copies");
     stack[1] = &knob (stackDetune, "Detune");
     stack[2] = &knob (stackWidth, "Width");
+    doubleKnobs[0] = &knob (dbl, "Level");
+    doubleKnobs[1] = &knob (dblDetune, "Detune");
+    doubleKnobs[2] = &knob (dblRate, "Rate");
+    doubleKnobs[3] = &knob (dblDelay, "Delay");
+    doubleKnobs[4] = &knob (dblWidth, "Width");
 
-    setSize (1080, 630);
+    for (int v = 0; v < 3; ++v)
+        voiceMuteSolo[v] = &muteSolo (vid (v, Params::mute), vid (v, Params::solo));
+    dryMuteSolo = &muteSolo (dryMute, drySolo);
+    doubleMuteSolo = &muteSolo (dblMute, dblSolo);
+
+    // switching Source to Instrument (by hand) also moves Harmony from Chords (Auto) to Intervals,
+    // which suits a lead instrument better; loading a session or automation never does
+    sourceParam = proc.state.getParameter (Params::source);
+    sourceParam->addListener (this);
+
+    setSize (1160, 780);
     timerCallback();
     startTimerHz (15);
 }
 
 ChoirvoyantEditor::~ChoirvoyantEditor()
 {
+    sourceParam->removeListener (this);
     setLookAndFeel (nullptr);
+}
+
+void ChoirvoyantEditor::parameterValueChanged (int, float newValue)
+{
+    if (sourceGesture && newValue > 0.5f)
+        switchToIntervals = true;   // acted on in the timer, on the message thread
+}
+
+void ChoirvoyantEditor::parameterGestureChanged (int, bool starting)
+{
+    sourceGesture = starting;   // only an edit in the editor (or a host control surface) makes a gesture
 }
 
 ChoirvoyantEditor::Knob& ChoirvoyantEditor::knob (const juce::String& id, const juce::String& caption)
@@ -137,8 +189,24 @@ ChoirvoyantEditor::Choice& ChoirvoyantEditor::choice (const juce::String& id, co
     return *c;
 }
 
+ChoirvoyantEditor::MuteSolo& ChoirvoyantEditor::muteSolo (const juce::String& muteId, const juce::String& soloId)
+{
+    auto* m = new MuteSolo (proc.state, muteId, soloId);
+    owned.add (m);
+    addAndMakeVisible (m);
+    return *m;
+}
+
 void ChoirvoyantEditor::timerCallback()
 {
+    if (switchToIntervals.exchange (false) && intParam (proc.state, Params::harmony) == HarmonyModes::ChordsAuto)
+    {
+        auto* h = proc.state.getParameter (Params::harmony);
+        h->beginChangeGesture();
+        h->setValueNotifyingHost (h->convertTo0to1 ((float) HarmonyModes::Intervals));
+        h->endChangeGesture();
+    }
+
     auto& e = proc.engine;
     const int root = e.statusRoot.load();
     const int cents = juce::roundToInt (e.statusTuning.load() * 100.0f);
@@ -187,8 +255,17 @@ void ChoirvoyantEditor::timerCallback()
     const bool phraseHint = sing == SingModes::PhraseEnds && intParam (proc.state, Params::lookahead) < 4;
     singOn->label.setText (phraseHint ? "Sing On  (best with 2 s)" : "Sing On", juce::dontSendNotification);
     singOn->label.setColour (juce::Label::textColourId, phraseHint ? accent : dim);
-    character[0]->setAlpha (live ? 0.35f : 1.0f);   // Entry Lag and Min Note need the lookahead
-    character[4]->setAlpha (live ? 0.35f : 1.0f);
+    // Entry Lag and Min Note need the lookahead; Instrument switches off the singer-only controls
+    const bool instrument = intParam (proc.state, Params::source) == 1;
+    character[0]->setAlpha (live || instrument ? 0.35f : 1.0f);   // Entry Lag
+    character[1]->setAlpha (instrument ? 0.35f : 1.0f);           // Humanize
+    character[2]->setAlpha (instrument ? 0.35f : 1.0f);           // Auto Formant
+    character[4]->setAlpha (live ? 0.35f : 1.0f);                 // Min Note
+    character[5]->setAlpha (instrument ? 0.35f : 1.0f);           // Consonants
+    vibrato[0]->setAlpha (instrument ? 0.35f : 1.0f);             // Depth (the instrument keeps its own vibrato)
+    for (int v = 0; v < 3; ++v)
+        if (instrument)
+            voiceKnobs[v][3]->setAlpha (0.35f);                   // Formant
     mode->setAlpha (1.0f);
 
     if (newKey != keyText || newChord != chordText || newLead != leadText || newHarmony != harmonyText)
@@ -217,7 +294,7 @@ void ChoirvoyantEditor::paint (juce::Graphics& g)
     auto h = headerArea;
     g.setColour (text);
     g.setFont (juce::FontOptions (26.0f, juce::Font::bold));
-    g.drawText ("Choirvoyant", h.removeFromLeft (190), juce::Justification::centredLeft);
+    g.drawText ("Choirvoyant", h.removeFromLeft (176), juce::Justification::centredLeft);
 
     auto readout = h.reduced (0, 8);
     g.setColour (panel);
@@ -231,11 +308,11 @@ void ChoirvoyantEditor::paint (juce::Graphics& g)
     label ("KEY", 30);
     g.setColour (accent);
     g.setFont (juce::FontOptions (15.0f, juce::Font::bold));
-    g.drawText (keyText, rr.removeFromLeft (150), juce::Justification::centredLeft);
+    g.drawText (keyText, rr.removeFromLeft (132), juce::Justification::centredLeft);
     label ("CHORD", 46);
     g.setColour (accent);
     g.setFont (juce::FontOptions (15.0f, juce::Font::bold));
-    g.drawText (chordText, rr.removeFromLeft (56), juce::Justification::centredLeft);
+    g.drawText (chordText, rr.removeFromLeft (50), juce::Justification::centredLeft);
     label ("LEAD", 36);
     g.setColour (text);
     g.drawText (leadText + "   " + harmonyText, rr, juce::Justification::centredLeft);
@@ -246,7 +323,13 @@ void ChoirvoyantEditor::paint (juce::Graphics& g)
     section (harmonyArea, "HARMONY", text);
     section (vibratoArea, "VIBRATO", text);
     section (stackArea, "STACK", text);
+    section (doubleArea, "DOUBLE", text);
     section (mixArea, "MIX", text);
+
+    // the M / S in MIX belong to the dry (original) signal
+    g.setColour (dim);
+    g.setFont (juce::FontOptions (11.0f));
+    g.drawText ("DRY", mixArea.reduced (10, 5).removeFromTop (18).withTrimmedRight (50), juce::Justification::centredRight);
 }
 
 void ChoirvoyantEditor::resized()
@@ -255,12 +338,13 @@ void ChoirvoyantEditor::resized()
 
     // header row: name + readout, then the key controls
     auto header = r.removeFromTop (60);
-    auto controls = header.removeFromRight (440);
+    auto controls = header.removeFromRight (546);
     headerArea = header;
     controls.removeFromLeft (14);
     key->setBounds (controls.removeFromLeft (90).withSizeKeepingCentre (84, 42));
     mode->setBounds (controls.removeFromLeft (96).withSizeKeepingCentre (90, 42));
     lookahead->setBounds (controls.removeFromLeft (130).withSizeKeepingCentre (124, 42));
+    source->setBounds (controls.removeFromLeft (110).withSizeKeepingCentre (104, 42));
     keyLock.setBounds (controls.withSizeKeepingCentre (controls.getWidth() - 8, 24).translated (0, 8));
     r.removeFromTop (14);
 
@@ -296,15 +380,31 @@ void ChoirvoyantEditor::resized()
     }
     r.removeFromTop (10);
 
-    // harmony + vibrato + stack + mix
-    const int quarter = (r.getWidth() - 30) / 4;
-    harmonyArea = r.removeFromLeft (quarter);
-    r.removeFromLeft (10);
-    vibratoArea = r.removeFromLeft (quarter);
-    r.removeFromLeft (10);
-    stackArea = r.removeFromLeft (quarter);
+    // harmony + vibrato + stack, then double + mix
+    auto row3 = r.removeFromTop (140);
+    r.removeFromTop (10);
+    const int third = (row3.getWidth() - 20) / 3;
+    harmonyArea = row3.removeFromLeft (third);
+    row3.removeFromLeft (10);
+    vibratoArea = row3.removeFromLeft (third);
+    row3.removeFromLeft (10);
+    stackArea = row3;
+    doubleArea = r.removeFromLeft ((r.getWidth() - 10) * 5 / 8);
     r.removeFromLeft (10);
     mixArea = r;
+
+    // M / S in the title bar of each source's section (Dry's in MIX)
+    auto titleRight = [] (juce::Rectangle<int> area) { return area.reduced (10, 5).removeFromTop (18).removeFromRight (46); };
+    for (int v = 0; v < 3; ++v)
+        voiceMuteSolo[v]->setBounds (titleRight (voiceArea[v]));
+    doubleMuteSolo->setBounds (titleRight (doubleArea));
+    dryMuteSolo->setBounds (titleRight (mixArea));
+    {
+        auto a = doubleArea.reduced (10).withTrimmedTop (18);
+        const int w = a.getWidth() / 5;
+        for (auto* k : doubleKnobs)
+            k->setBounds (a.removeFromLeft (w));
+    }
     {
         auto a = harmonyArea.reduced (10).withTrimmedTop (18);
         longNote->setBounds (a.removeFromRight (80));

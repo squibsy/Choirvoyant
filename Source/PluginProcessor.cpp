@@ -16,10 +16,15 @@ ChoirvoyantProcessor::ChoirvoyantProcessor()
     using namespace Params;
     for (int v = 0; v < 3; ++v)
         vp[v] = { get (vid (v, interval)), get (vid (v, level)), get (vid (v, pan)), get (vid (v, delay)), get (vid (v, formant)),
-                  get (vid (v, position)), get (vid (v, motion)) };
+                  get (vid (v, position)), get (vid (v, motion)), get (vid (v, mute)), get (vid (v, solo)) };
 
     key = get (Params::key);                 mode = get (Params::mode);             keyLock = get (Params::keyLock);
     harmony = get (Params::harmony);         singOn = get (Params::singOn);         longNote = get (Params::longNote);
+    source = get (Params::source);
+    dbl = get (Params::dbl);                 dblDetune = get (Params::dblDetune);   dblRate = get (Params::dblRate);
+    dblDelay = get (Params::dblDelay);       dblWidth = get (Params::dblWidth);
+    dryMute = get (Params::dryMute);         drySolo = get (Params::drySolo);
+    dblMute = get (Params::dblMute);         dblSolo = get (Params::dblSolo);
     lookahead = get (Params::lookahead);     voices = get (Params::voices);
     stack = get (Params::stack);             stackDetune = get (Params::stackDetune); stackWidth = get (Params::stackWidth);
     entryLag = get (Params::entryLag);       humanize = get (Params::humanize);     autoFormant = get (Params::autoFormant);
@@ -53,6 +58,8 @@ HarmonySettings ChoirvoyantProcessor::snapshot() const
         o.formantSemis = f (vp[v].formant);
         o.position = i (vp[v].position);
         o.motion = i (vp[v].motion);
+        o.mute = f (vp[v].mute) > 0.5f;
+        o.solo = f (vp[v].solo) > 0.5f;
     }
     s.keyMode = i (key);
     s.scaleMode = i (mode);
@@ -60,6 +67,16 @@ HarmonySettings ChoirvoyantProcessor::snapshot() const
     s.harmonyMode = i (harmony);
     s.singOn = i (singOn);
     s.longNoteMs = f (longNote);
+    s.instrument = i (source) == 1;
+    s.doubleDb = f (dbl);
+    s.doubleDetuneCents = f (dblDetune);
+    s.doubleRateHz = f (dblRate);
+    s.doubleDelayMs = f (dblDelay);
+    s.doubleWidth = f (dblWidth);
+    s.dryMute = f (dryMute) > 0.5f;
+    s.drySolo = f (drySolo) > 0.5f;
+    s.doubleMute = f (dblMute) > 0.5f;
+    s.doubleSolo = f (dblSolo) > 0.5f;
     s.voices = i (voices);
     s.stack = i (stack);
     s.stackDetuneCents = f (stackDetune);

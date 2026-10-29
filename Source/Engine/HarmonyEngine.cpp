@@ -7,7 +7,8 @@ namespace
 {
     constexpr double pi = 3.14159265358979323846;
     constexpr int chunkSize = 512;
-    constexpr float minHz = 70.0f, maxHz = 1100.0f;
+    constexpr float minHz = 70.0f, maxHz = 1600.0f;   // up to ~G6: the top of a guitar neck, and any singer
+    constexpr float deepMinHz = 30.0f;                // Instrument: down to bass guitar
     constexpr float minBeta = 0.6f, maxBeta = 1.7f;
 
     int64_t nextPow2 (int64_t x)
@@ -59,12 +60,14 @@ void HarmonyEngine::prepare (double sampleRate, double lookaheadSeconds)
     hop = 256;
     while (sr / hop > 260.0)
         hop *= 2;
-    // live mode uses a half-length frame: less delay, but a higher pitch floor (~94 Hz at 48 kHz)
+    // Voice: 70 Hz and up. Instrument: a frame twice as long reaches 30 Hz (bass guitar, baritone).
+    // Live: a half-length frame, less delay but a higher floor (~94 Hz at 48 kHz). All allocated here.
     trackerFull.prepare (sr, hop * 8, minHz, maxHz);
+    trackerDeep.prepare (sr, hop * 16, deepMinHz, maxHz);
     trackerLive.prepare (sr, hop * 4, minHz, maxHz);
-    frameLen = hop * 8;
+    frameLen = hop * 16;
 
-    maxHalf = (int) std::ceil (sr / minHz / minBeta) + 4;
+    maxHalf = (int) std::ceil (sr / deepMinHz / minBeta) + 4;
     uvSpacing = (float) (sr * 0.005);
 
     // lookahead + per-voice delay (250 ms) + entry lag (~200 ms) + analysis frame
@@ -105,12 +108,17 @@ void HarmonyEngine::prepare (double sampleRate, double lookaheadSeconds)
 void HarmonyEngine::setLookahead (double seconds)
 {
     live = seconds <= 0.0;
-    tracker = live ? &trackerLive : &trackerFull;
+    configureAnalysis();
+    latency = (int) std::lround ((live ? liveLatencySeconds : std::clamp (seconds, 0.05, maxLookaheadSeconds)) * sr);
+    reset();
+}
+
+void HarmonyEngine::configureAnalysis()
+{
+    tracker = live ? &trackerLive : deep ? &trackerDeep : &trackerFull;
     frameLen = tracker->getFrameLength();
     medianRadius = live ? 1 : 2;
     onsetFrames = live ? 2 : 3;
-    latency = (int) std::lround ((live ? liveLatencySeconds : std::clamp (seconds, 0.05, maxLookaheadSeconds)) * sr);
-    reset();
 }
 
 void HarmonyEngine::reset()
@@ -184,9 +192,32 @@ float HarmonyEngine::random01()
 
 //==============================================================================
 void HarmonyEngine::process (const float* const* in, int numIn, float* const* out, int numOut, int numSamples,
-                             const HarmonySettings& s, const MidiEvent* midi, int numMidi)
+                             const HarmonySettings& settings, const MidiEvent* midi, int numMidi)
 {
-    const float dryTarget = dbToGain (s.dryDb, -59.9f);
+    // Instrument analysis reaches down to bass range (not live: the longer frame needs the lookahead).
+    // Switching starts the analysis over, like changing the lookahead.
+    if (const bool wantDeep = settings.instrument && ! live; wantDeep != deep)
+    {
+        deep = wantDeep;
+        configureAnalysis();
+        reset();
+    }
+
+    HarmonySettings s = settings;
+    if (s.instrument)
+    {
+        s.entryLagMs = s.humanize = s.consonants = s.autoFormant = s.vibDepthCents = 0.0f;
+        for (auto& v : s.voice)
+            v.formantSemis = 0.0f;
+    }
+
+    // mute / solo: a muted source is silent; while anything is soloed, only soloed sources play
+    bool anySolo = s.drySolo || s.doubleSolo;
+    for (int v = 0; v < s.voices; ++v)
+        anySolo = anySolo || s.voice[v].solo;
+    auto audible = [anySolo] (bool mute, bool solo) { return ! mute && (! anySolo || solo); };
+
+    const float dryTarget = audible (s.dryMute, s.drySolo) ? dbToGain (s.dryDb, -59.9f) : 0.0f;
     const float wetTarget = dbToGain (s.wetDb, -59.9f);
     currentSig = signature (s, live);
 
@@ -237,7 +268,8 @@ void HarmonyEngine::process (const float* const* in, int numIn, float* const* ou
         {
             auto& x = inst[i];
             const int v = i / 3, c = i % 3;
-            const bool active = v < s.voices && c < s.stack;
+            const bool doubler = i >= firstDoubler;
+            const bool active = doubler ? s.doubleDb > -59.9f : v < s.voices && c < s.stack;
             if (! active)
             {
                 if (x.active)
@@ -255,11 +287,21 @@ void HarmonyEngine::process (const float* const* in, int numIn, float* const* ou
             }
             synthesise (i, genLimit, s);
 
-            const auto& vs = s.voice[v];
-            const float spread = c == 1 ? -0.5f : c == 2 ? 0.5f : 0.0f;
-            const float pan = std::clamp (vs.pan + spread * s.stackWidth, -1.0f, 1.0f);
+            float pan = 0.0f, level = 0.0f;
+            if (doubler)
+            {
+                // the two copies of the lead sit either side of it
+                pan = (i == firstDoubler ? -1.0f : 1.0f) * s.doubleWidth;
+                level = audible (s.doubleMute, s.doubleSolo) ? dbToGain (s.doubleDb, -59.9f) * std::sqrt (2.0f) : 0.0f;
+            }
+            else
+            {
+                const auto& vs = s.voice[v];
+                const float spread = c == 1 ? -0.5f : c == 2 ? 0.5f : 0.0f;
+                pan = std::clamp (vs.pan + spread * s.stackWidth, -1.0f, 1.0f);
+                level = audible (vs.mute, vs.solo) ? dbToGain (vs.levelDb, -47.9f) / std::sqrt ((float) s.stack) * std::sqrt (2.0f) : 0.0f;
+            }
             const float angle = (float) ((pan + 1.0f) * pi * 0.25);
-            const float level = dbToGain (vs.levelDb, -47.9f) / std::sqrt ((float) s.stack) * std::sqrt (2.0f);
             panTargetL[i] = level * std::cos (angle);
             panTargetR[i] = level * std::sin (angle);
         }
@@ -558,7 +600,7 @@ void HarmonyEngine::computeKey (int64_t k)
             if (e < w0)
                 break;
             const double a = std::max ((double) n.start, w0), b = std::min (e, w1);
-            if (b > a && e - (double) n.start >= 0.1 * sr)   // shorter fragments are mostly slides
+            if (b > a && e - (double) n.start >= 0.1 * sr && ! isGlide (n))   // short fragments and bends aren't key evidence
             {
                 const double d = 0.5 * (a + b) - tk, len = (b - a) / sr;
                 const double zl = d / (d < 0.0 ? longPast : sigmaFuture), zs = d / (d < 0.0 ? shortPast : sigmaFuture);
@@ -780,6 +822,23 @@ void HarmonyEngine::toneSpan (int64_t noteIdx, int64_t& first, int64_t& last) co
         absorb (++last);
 }
 
+bool HarmonyEngine::isGlide (const Note& n) const
+{
+    // A bend or slide: after the attack, the pitch moves steadily one way by more than half a
+    // semitone (vibrato swings both ways, so its start and end thirds stay level).
+    const int skip = std::min (n.numPitches / 4, (int) (0.2 * sr / hop));
+    const int count = n.numPitches - skip;
+    if (count < 6)
+        return false;
+    float a[Note::maxPitches], b[Note::maxPitches];
+    const int third = count / 3;
+    std::copy (n.pitches + skip, n.pitches + skip + third, a);
+    std::copy (n.pitches + n.numPitches - third, n.pitches + n.numPitches, b);
+    std::nth_element (a, a + third / 2, a + third);
+    std::nth_element (b, b + third / 2, b + third);
+    return std::abs (b[third / 2] - a[third / 2]) > 0.5f;
+}
+
 bool HarmonyEngine::noteSings (int64_t noteIdx, double t, const HarmonySettings& s) const
 {
     if (s.singOn == SingModes::All)
@@ -865,7 +924,7 @@ namespace
     }
 }
 
-int HarmonyEngine::chooseDegree (int64_t noteIdx, int prevDegree, const Chords::Chord chords[], float grid)
+int HarmonyEngine::chooseDegree (int64_t noteIdx, int prevDegree, const Chords::Chord chords[], float grid, int majorRoot)
 {
     // Viterbi over the known notes from this one to the edge of the lookahead (just this one when
     // live), starting from the previous note's chord. Only the first step is kept.
@@ -879,8 +938,15 @@ int HarmonyEngine::chooseDegree (int64_t noteIdx, int prevDegree, const Chords::
         const auto& n = note (j);
         if (j > noteIdx && (live || n.start - start > latency))
             break;
-        pcs[steps] = pcOf ((int) std::lround (n.midi - grid));
-        lens[steps] = (float) ((double) (noteEnd (n) - n.start) / sr);
+        // A note clearly on a semitone keeps its name (a deliberate chromatic note is chord evidence);
+        // one between semitones (a quarter-tone "blue" bend, a sloppy note) counts as the scale note it's nearest
+        const float rel = n.midi - grid;
+        int name = (int) std::lround (rel);
+        if (std::abs (rel - (float) name) > 0.3f)
+            diatonic (rel, majorRoot, 0, name);
+        pcs[steps] = pcOf (name);
+        // a bend or slide counts like a passing note: it shouldn't pull the chord its way
+        lens[steps] = isGlide (n) ? 0.05f : (float) ((double) (noteEnd (n) - n.start) / sr);
         ++steps;
     }
 
@@ -1117,7 +1183,7 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
             {
                 Chords::Chord chords[Chords::numDiatonic];
                 Chords::diatonic (tonic, minor, chords);
-                n.chordDegree = chooseDegree (noteIdx, prev != nullptr ? prev->chordDegree : -1, chords, grid);
+                n.chordDegree = chooseDegree (noteIdx, prev != nullptr ? prev->chordDegree : -1, chords, grid, majorRoot);
                 n.chord = chords[n.chordDegree];
             }
 
@@ -1131,11 +1197,29 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
         }
     }
 
-    // a passing note keeps the previous harmony (and chord) instead of jumping with it
     const double len = (double) (noteEnd (n) - n.start);
-    if (depth == 0 && ! live && s.harmonyMode != HarmonyModes::MidiNotes && prev != nullptr && len < s.minNoteMs * 0.001 * sr
-        && (double) (n.start - noteEnd (*prev)) < 0.3 * sr)
+    const bool follows = depth == 0 && s.harmonyMode != HarmonyModes::MidiNotes && prev != nullptr
+                         && (double) (n.start - noteEnd (*prev)) < 0.3 * sr;
+
+    if (follows && isGlide (n))
     {
+        // A bend or slide is on its way somewhere, not a note to harmonize: the voices keep the
+        // previous note's interval, so they bend and slide along with the lead
+        for (int v = 0; v < 3; ++v)
+            if (prev->voiceOn[v])
+            {
+                n.target[v] = prev->target[v];
+                n.leadRef[v] = prev->leadRef[v];
+            }
+        if (prev->chord.valid() && s.harmonyMode != HarmonyModes::Intervals)
+        {
+            n.chord = prev->chord;
+            n.chordDegree = prev->chordDegree;
+        }
+    }
+    else if (follows && ! live && len < s.minNoteMs * 0.001 * sr)
+    {
+        // a passing note keeps the previous harmony notes (and chord) instead of jumping with it
         for (int v = 0; v < 3; ++v)
         {
             const float heldNote = prev->target[v];
@@ -1161,7 +1245,9 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
 {
     auto& x = inst[i];
     const int v = i / 3, c = i % 3;
-    const auto& vs = s.voice[v];
+    static const VoiceSettings doublerVoice {};
+    const bool doubler = i >= firstDoubler;   // a copy of the lead itself (Double)
+    const auto& vs = doubler ? doublerVoice : s.voice[v];
 
     if (numMarks == 0 || numFinal == 0)
     {
@@ -1169,9 +1255,11 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
         return;
     }
 
-    const double fixedDelay = vs.delayMs * 0.001 * sr;
-    const float stackDetune = (c == 1 ? s.stackDetuneCents : c == 2 ? -s.stackDetuneCents : 0.0f) * 0.01f;
-    const float vibRate = s.vibRateHz * (1.0f + 0.03f * (float) (i - 4));   // stacked copies never lock in phase
+    // the two doubles sit at different short delays, so they don't comb against each other
+    const double fixedDelay = (doubler ? s.doubleDelayMs * (i == firstDoubler ? 1.0 : 0.62) : vs.delayMs) * 0.001 * sr;
+    const float stackDetune = doubler ? 0.0f : (c == 1 ? s.stackDetuneCents : c == 2 ? -s.stackDetuneCents : 0.0f) * 0.01f;
+    // the doubles' detune LFOs run at slightly different rates; stacked copies' vibratos never lock in phase
+    const float vibRate = doubler ? s.doubleRateHz * (i == firstDoubler ? 1.0f : 1.17f) : s.vibRateHz * (1.0f + 0.03f * (float) (i - 4));
 
     while (x.nextMark < genLimit)
     {
@@ -1180,7 +1268,7 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
 
         // ---- late entry: jump back at each note onset, then catch up before the note ends ----
         double lagNow = 0.0;
-        const int64_t ui = noteIndexAt (u);
+        const int64_t ui = doubler ? -1 : noteIndexAt (u);   // a double comes in with the lead
         if (ui >= 0)
         {
             auto& n = note (ui);
@@ -1238,13 +1326,13 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
         const Mark m = marks[(size_t) (mi & markMask)];
 
         float shiftTarget = x.shift, vib = 0.0f, det = 0.0f;
-        if (use >= 0)
+        if (use >= 0 && ! doubler)
             harmonize (use, s);
         // Sing On is decided on the voice's own timeline (u), not on the audio it re-reads while
         // entering late, or a voice would flicker on the tail of a note it doesn't sing. With
         // lookahead it also starts fading just before a note it won't sing.
         bool sings = true;
-        if (s.singOn != SingModes::All)
+        if (s.singOn != SingModes::All && ! doubler)
         {
             auto around = [this] (double t) -> int64_t {
                 const int64_t at = noteIndexAt (t);
@@ -1260,7 +1348,13 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
             sings = now >= 0 && noteSings (now, u, s) && (soon < 0 || soon == now || noteSings (soon, u + 0.03 * sr, s));
         }
 
-        if (use >= 0 && ! (note (use).voiceOn[v] && sings))
+        if (doubler)
+        {
+            // unison with the lead, slowly detuned by an LFO; the two doubles move in opposite directions
+            shiftTarget = 0.0f;
+            det = s.doubleDetuneCents * 0.01f * std::sin (x.vibPhase + (i == firstDoubler ? 0.0f : (float) pi));
+        }
+        else if (use >= 0 && ! (note (use).voiceOn[v] && sings))
             gate = 0.0f;   // this voice rests here (Sing On, or fewer MIDI notes held than voices)
         else if (use >= 0)
         {

@@ -37,11 +37,11 @@ public:
     HarmonyEngine engine;
 
 private:
-    struct VoicePtrs { std::atomic<float> *interval, *level, *pan, *delay, *formant, *position, *motion; };
+    struct VoicePtrs { std::atomic<float> *interval, *level, *pan, *delay, *formant, *position, *motion, *mute, *solo; };
     VoicePtrs vp[3] {};
-    std::atomic<float> *key, *mode, *keyLock, *harmony, *singOn, *longNote, *lookahead, *voices, *stack, *stackDetune,
+    std::atomic<float> *key, *mode, *source, *keyLock, *harmony, *singOn, *longNote, *lookahead, *voices, *stack, *stackDetune,
                        *stackWidth, *entryLag, *humanize, *autoFormant, *tightness, *minNote, *vibDepth, *vibRate, *vibDelay,
-                       *consonants, *dry, *wet;
+                       *consonants, *dry, *wet, *dbl, *dblDetune, *dblRate, *dblDelay, *dblWidth, *dryMute, *drySolo, *dblMute, *dblSolo;
 
     HarmonySettings snapshot() const;
     std::vector<HarmonyEngine::MidiEvent> midiEvents;
