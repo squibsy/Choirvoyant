@@ -9,6 +9,8 @@ namespace
     constexpr int chunkSize = 512;
     constexpr float minHz = 70.0f, maxHz = 1600.0f;   // up to ~G6: the top of a guitar neck, and any singer
     constexpr float deepMinHz = 30.0f;                // Instrument: down to bass guitar
+    constexpr float consonantFloor = 0.001f;          // rms (-60 dBFS): below this, between notes is silence
+                                                      // (only gates copying the source, so erring low is harmless)
     constexpr float minBeta = 0.6f, maxBeta = 1.7f;
 
     int64_t nextPow2 (int64_t x)
@@ -391,9 +393,12 @@ void HarmonyEngine::process (const float* const* in, int numIn, float* const* ou
 //==============================================================================
 void HarmonyEngine::analyse()
 {
-    while (numRaw * hop + frameLen / 2 <= head)
+    // YIN measures the first half of its frame (its integration window, plus lags into the second
+    // half), so the frame starts a quarter-frame before its time: the measured stretch is centred on
+    // the time the pitch is filed under. (Centring the whole frame put every pitch ~11 ms early.)
+    while (numRaw * hop + frameLen * 3 / 4 <= head)
     {
-        const int64_t start = numRaw * hop - frameLen / 2;
+        const int64_t start = numRaw * hop - frameLen / 4;
         for (int k = 0; k < frameLen; ++k)
         {
             const int64_t idx = start + k;
@@ -605,7 +610,9 @@ void HarmonyEngine::computeKey (int64_t k)
                 const double d = 0.5 * (a + b) - tk, len = (b - a) / sr;
                 const double zl = d / (d < 0.0 ? longPast : sigmaFuture), zs = d / (d < 0.0 ? shortPast : sigmaFuture);
                 keyNotes[(size_t) numLong++] = { n.midi, (float) (len * std::exp (-0.5 * zl * zl)) };
-                if (numShort < maxShort && d > -2.5 * shortPast)
+                // the short window (which can overturn the key) only trusts held notes: slide pieces and
+                // ornaments under 250 ms can land on any note
+                if (numShort < maxShort && d > -2.5 * shortPast && e - (double) n.start >= 0.25 * sr)
                     shortNotes[numShort++] = { n.midi, (float) (len * std::exp (-0.5 * zs * zs)) };
             }
         }
@@ -621,6 +628,20 @@ void HarmonyEngine::computeKey (int64_t k)
     keyLast = k;
 }
 
+float HarmonyEngine::periodAt (double t) const
+{
+    // The source's period at t, or 0 where nothing is sung. Inside a note, a frame whose voicing
+    // flickers (breathy tone, wide vibrato) still takes the note's pitch: an unvoiced grain is
+    // copied unshifted, so the harmony would jump to the lead's own note and back.
+    const auto& f = frameAt (t);
+    if (f.voiced)
+        return (float) (sr / f.f0);
+    const int64_t ni = noteIndexAt (t);
+    if (ni >= 0 && (note (ni).end < 0 || t < (double) note (ni).end))
+        return (float) (sr / (440.0 * std::exp2 ((note (ni).midi - 69.0) / 12.0)));
+    return 0.0f;
+}
+
 void HarmonyEngine::placeMarks()
 {
     if (numFinal == 0)
@@ -630,15 +651,15 @@ void HarmonyEngine::placeMarks()
     const double limit = (double) ((numFinal - 1) * hop);
     for (;;)
     {
-        const auto& f = frameAt (lastMark);
-        const double t = lastMark + (f.voiced ? sr / f.f0 : uvSpacing);
+        const float here = periodAt (lastMark);
+        const double t = lastMark + (here > 0.0f ? here : uvSpacing);
         if (t > limit)
             break;
-        const auto& g = frameAt (t);
+        const float period = periodAt (t);
         auto& m = marks[(size_t) (numMarks & markMask)];
         m.t = t;
-        m.voiced = g.voiced;
-        m.period = g.voiced ? (float) (sr / g.f0) : uvSpacing;
+        m.voiced = period > 0.0f;
+        m.period = period > 0.0f ? period : uvSpacing;
         ++numMarks;
         lastMark = t;
     }
@@ -647,6 +668,21 @@ void HarmonyEngine::placeMarks()
 //==============================================================================
 // Lookups
 //==============================================================================
+float HarmonyEngine::midiAt (double t) const
+{
+    // the singer's pitch between two analysis frames, interpolated so corrections don't step
+    if (numFinal < 2)
+        return 0.0f;
+    const int64_t lo = std::max<int64_t> (0, numFinal - (int64_t) frames.size() + 1);
+    const double pos = std::clamp (t / hop, (double) lo, (double) (numFinal - 1));
+    const auto j = (int64_t) std::floor (pos);
+    const auto& a = frames[(size_t) (j & frameMask)];
+    const auto& b = frames[(size_t) (std::min (j + 1, numFinal - 1) & frameMask)];
+    if (a.voiced && b.voiced)
+        return a.midi + (b.midi - a.midi) * (float) (pos - (double) j);
+    return a.voiced ? a.midi : b.voiced ? b.midi : 0.0f;
+}
+
 const HarmonyEngine::Frame& HarmonyEngine::frameAt (double t) const
 {
     static const Frame silent;
@@ -996,17 +1032,27 @@ int HarmonyEngine::chooseDegree (int64_t noteIdx, int prevDegree, const Chords::
     return c;
 }
 
-void HarmonyEngine::voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, const HarmonySettings& s,
-                                float out[3]) const
+void HarmonyEngine::voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, int majorRoot,
+                                const HarmonySettings& s, float out[3]) const
 {
     // Each voice gets a short list of chord tones in its register, each with its own cost (movement,
     // register, clashes with the lead, parallels). The voicing is then chosen jointly, so the voices
     // share the chord between them: no two on the same note, and the chord keeps its 3rd.
-    constexpr int maxCand = 12;
+    //
+    // When the lead sings a note outside the chord (a passing "re" over the tonic, say), chord tones
+    // a 2nd away would clash, so the upper voices may also take a scale note a 3rd or 6th from the
+    // lead and move in parallel with it, as backing singers do over passing notes.
+    constexpr int maxCand = 16;
     int cand[3][maxCand];
     float candCost[3][maxCand];
     int numCand[3] {};
     const int dl = prev != nullptr ? lead - prevLead : 0;
+    const bool leadInChord = chord.has (lead);
+    auto inScale = [majorRoot] (int p) {
+        const int d = pcOf (p - majorRoot);
+        return d == 0 || d == 2 || d == 4 || d == 5 || d == 7 || d == 9 || d == 11;
+    };
+    auto thirdOrSixth = [lead] (int p) { const int iv = pcOf (p - lead); return iv == 3 || iv == 4 || iv == 8 || iv == 9; };
 
     for (int v = 0; v < 3; ++v)
     {
@@ -1023,7 +1069,8 @@ void HarmonyEngine::voiceChord (const Note* prev, int lead, int prevLead, const 
         }
 
         const bool bass = pos == Positions::Bass;
-        auto fits = [&] (int p) { return bass ? pcOf (p) == chord.root : chord.has (p); };
+        auto passingTone = [&] (int p) { return ! bass && ! leadInChord && ! chord.has (p) && inScale (p) && thirdOrSixth (p); };
+        auto fits = [&] (int p) { return bass ? pcOf (p) == chord.root : chord.has (p) || passingTone (p); };
         const bool hasPrev = prev != nullptr && prev->voiceOn[v];
         const int pv = hasPrev ? (int) std::lround (prev->target[v]) : 0;
 
@@ -1044,6 +1091,8 @@ void HarmonyEngine::voiceChord (const Note* prev, int lead, int prevLead, const 
                 if (! fits (p))
                     continue;
                 float cost = 0.25f * std::abs ((float) p - ((float) lead + nominal));
+                if (passingTone (p))
+                    cost += 0.5f;                                // a chord tone is preferred when it doesn't clash
                 if (hasPrev)
                     cost += 0.7f * (float) std::abs (p - pv);
                 if (pcOf (p) == pcOf (lead))
@@ -1096,7 +1145,7 @@ void HarmonyEngine::voiceChord (const Note* prev, int lead, int prevLead, const 
                             && s.voice[w].position != Positions::Bass)
                             cost += pcOf (p) == chord.root ? 1.0f : 4.0f;   // two voices on one note: fine for the root only
                 }
-                if (! hasThird)
+                if (! hasThird && leadInChord)   // over a passing note the voices follow the lead instead
                     cost += 2.0f;
                 if (cost < bestCost)
                 {
@@ -1130,9 +1179,15 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
     bool minor = false;
     scaleAt (at, s, majorRoot, tonic, minor);
 
+    // The note the singer meant: a note sung between semitones counts as the scale note it's nearest
+    // (sloppy intonation); one sung squarely on a semitone keeps its name, even outside the scale (a
+    // deliberate chromatic note). Snapping that too would put the harmony a semitone off its target.
     const float rel = n.midi - grid;
-    int snapped = (int) std::lround (rel);
-    diatonic (rel, majorRoot, 0, snapped);   // the scale note the singer was aiming for
+    const int onGrid = (int) std::lround (rel);
+    const bool meantAsSung = std::abs (rel - (float) onGrid) <= 0.3f;
+    int snapped = onGrid;
+    if (! meantAsSung)
+        diatonic (rel, majorRoot, 0, snapped);
 
     // the previous note, for voice leading and passing-note holds (only harmonized one level deep)
     const Note* prev = nullptr;
@@ -1154,7 +1209,7 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
                 const int steps = Intervals::steps (s.voice[v].interval);
                 int lead = (int) std::lround (rel);
                 n.target[v] = steps % 7 == 0 ? (float) (lead + 12 * (steps / 7)) : diatonic (rel, majorRoot, steps, lead);
-                n.leadRef[v] = lead;
+                n.leadRef[v] = meantAsSung ? onGrid : lead;
                 n.voiceOn[v] = true;
             }
             break;
@@ -1187,7 +1242,7 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
                 n.chord = chords[n.chordDegree];
             }
 
-            voiceChord (prev, snapped, prev != nullptr ? prev->leadRef[0] : snapped, n.chord, s, n.target);
+            voiceChord (prev, snapped, prev != nullptr ? prev->leadRef[0] : snapped, n.chord, majorRoot, s, n.target);
             for (int v = 0; v < 3; ++v)
             {
                 n.leadRef[v] = snapped;
@@ -1200,8 +1255,23 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
     const double len = (double) (noteEnd (n) - n.start);
     const bool follows = depth == 0 && s.harmonyMode != HarmonyModes::MidiNotes && prev != nullptr
                          && (double) (n.start - noteEnd (*prev)) < 0.3 * sr;
+    const bool continuation = follows && (double) (n.start - noteEnd (*prev)) < 0.05 * sr
+                              && std::lround (n.midi - grid) == std::lround (prev->midi - prev->tuning);
 
-    if (follows && isGlide (n))
+    if (continuation)
+    {
+        // The same sung note, split in two by the tracker (a wobble, a breath of a consonant):
+        // the harmony carries on as it was rather than re-voicing in the middle of the note
+        for (int v = 0; v < 3; ++v)
+        {
+            n.target[v] = prev->target[v];
+            n.leadRef[v] = prev->leadRef[v];
+            n.voiceOn[v] = prev->voiceOn[v];
+        }
+        n.chord = prev->chord;
+        n.chordDegree = prev->chordDegree;
+    }
+    else if (follows && isGlide (n))
     {
         // A bend or slide is on its way somewhere, not a note to harmonize: the voices keep the
         // previous note's interval, so they bend and slide along with the lead
@@ -1219,11 +1289,16 @@ void HarmonyEngine::harmonize (int64_t noteIdx, const HarmonySettings& s, int de
     }
     else if (follows && ! live && len < s.minNoteMs * 0.001 * sr)
     {
-        // a passing note keeps the previous harmony notes (and chord) instead of jumping with it
+        // a passing note keeps the previous harmony notes (and chord) instead of jumping with it,
+        // as long as a held note doesn't clash with it (a 2nd, 7th or tritone); a clashing voice
+        // takes the note it was just voiced to instead (a chord tone, or a 3rd/6th from the lead)
+        const bool upperOnly = s.harmonyMode != HarmonyModes::Intervals;
         for (int v = 0; v < 3; ++v)
         {
             const float heldNote = prev->target[v];
-            if (prev->voiceOn[v] && std::abs (heldNote - (float) n.leadRef[v]) <= 9.0f && std::lround (heldNote) != n.leadRef[v])
+            const bool bassVoice = upperOnly && s.voice[v].position == Positions::Bass;
+            const bool clashes = ! bassVoice && dissonantWith ((int) std::lround (heldNote) - n.leadRef[v]);
+            if (prev->voiceOn[v] && ! clashes && std::abs (heldNote - (float) n.leadRef[v]) <= 9.0f && std::lround (heldNote) != n.leadRef[v])
                 n.target[v] = heldNote;
         }
         if (prev->chord.valid() && s.harmonyMode != HarmonyModes::Intervals)
@@ -1302,13 +1377,24 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
         }
         else
         {
+            // Between notes the voice still sings the consonants attached to them: the "h" leading
+            // into a note (up to 200 ms) and the "s" trailing after one (up to 250 ms), as long as
+            // the singer is making sound all the way to the note. Silence closes the voice.
+            auto soundedBetween = [this] (double a, double b) {
+                for (double t = a; t <= b; t += hop)
+                    if (frameAt (t).rms < consonantFloor)
+                        return false;
+                return true;
+            };
             const int64_t nx = ri + 1;
-            if (noteValid (nx) && (double) note (nx).start - tr < 0.03 * sr)
+            const double toNext = noteValid (nx) ? (double) note (nx).start - tr : 1.0e9;
+            const double sinceEnd = ri >= 0 ? tr - (double) noteEnd (note (ri)) : 1.0e9;
+            if (toNext < 0.03 * sr || (toNext < 0.2 * sr && soundedBetween (tr, (double) note (nx).start)))
             {
                 use = nx;
                 gate = 1.0f;
             }
-            else if (ri >= 0 && tr - (double) noteEnd (note (ri)) < 0.06 * sr)
+            else if (sinceEnd < 0.06 * sr || (sinceEnd < 0.25 * sr && soundedBetween ((double) noteEnd (note (ri)), tr)))
             {
                 use = ri;
                 gate = 1.0f;
@@ -1325,7 +1411,7 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
         }
         const Mark m = marks[(size_t) (mi & markMask)];
 
-        float shiftTarget = x.shift, vib = 0.0f, det = 0.0f;
+        float shiftTarget = x.shift, vib = 0.0f, det = 0.0f, tightComp = 0.0f;
         if (use >= 0 && ! doubler)
             harmonize (use, s);
         // Sing On is decided on the voice's own timeline (u), not on the audio it re-reads while
@@ -1362,11 +1448,17 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
             // both the lead and the harmony note sit on the singer's own tuning grid
             const float target = n.target[v] + n.tuning;
             const float lead = (float) n.leadRef[v] + n.tuning;   // the scale note the singer was aiming for
-            float leadRef = lead;
-            const auto& f = frameAt (tr);
-            if (s.tightness > 0.0f && inside && f.voiced)
-                leadRef = lead + s.tightness * std::clamp (f.midi - lead, -1.0f, 1.0f);
-            shiftTarget = target - leadRef;
+            shiftTarget = target - lead;
+
+            // Tightness cancels the singer's own pitch movement (vibrato, wobble) around the note.
+            // Applied directly, not through the note-change smoothing: smoothing would lag the
+            // vibrato it cancels and leave a wobble of its own.
+            if (s.tightness > 0.0f && inside)
+            {
+                const float now = midiAt (tr);
+                if (now > 0.0f)
+                    tightComp = -s.tightness * std::clamp (now - lead, -1.0f, 1.0f);
+            }
 
             const double len = (double) (noteEnd (n) - n.start);
             const double vibDelay = s.vibDelayMs * 0.001 * sr;
@@ -1387,7 +1479,8 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
             x.gain = 0.0f;
             x.primed = true;
         }
-        x.shift += (shiftTarget - x.shift) * (1.0f - std::exp (-step0 / (float) (0.012 * sr)));
+        // glide between harmony notes like a singer (~35 ms), not a hard-tuned step
+        x.shift += (shiftTarget - x.shift) * (1.0f - std::exp (-step0 / (float) (0.035 * sr)));
         if (gate > 0.0f)
             x.formantInterval += (shiftTarget - x.formantInterval) * (1.0f - std::exp (-step0 / (float) (1.5 * sr)));
 
@@ -1396,7 +1489,7 @@ void HarmonyEngine::synthesise (int i, double genLimit, const HarmonySettings& s
             x.driftTarget = (2.0f * random01() - 1.0f) * s.humanize * 0.05f;
         x.drift += (x.driftTarget - x.drift) * (1.0f - std::exp (-step0 / (float) (0.2 * sr)));
 
-        const float semis = x.shift + vib + det + stackDetune + x.drift;
+        const float semis = x.shift + tightComp + vib + det + stackDetune + x.drift;
         const float ratio = std::clamp (std::exp2 (semis / 12.0f), 0.25f, 4.0f);
 
         // backing-singer modes fade voices in and out rather than cutting them

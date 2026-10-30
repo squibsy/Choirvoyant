@@ -241,6 +241,8 @@ namespace
         s.voices = numVoices;
         s.dryDb = -60.0f;
         s.entryLagMs = s.humanize = s.vibDepthCents = s.consonants = 0.0f;
+        if (const char* k = std::getenv ("CHV_TIGHT"))
+            s.tightness = (float) std::atof (k);
         for (auto& v : s.voice)
             v.levelDb = 0.0f;
         return s;
@@ -339,7 +341,15 @@ namespace
                 const int a = (int) ((m.start + 0.08) * sr), b = (int) ((m.start + m.dur - 0.04) * sr);
                 const float got = medianPitch (out.getReadPointer (0) + a, b - a);
                 ++checked;
-                bad += std::abs (got - (n->target[0] + n->tuning)) < 0.5f ? 0 : 1;
+                const bool off = std::abs (got - (n->target[0] + n->tuning)) >= 0.5f;
+                bad += off ? 1 : 0;
+                if (off)
+                {
+                    char chord[16];
+                    Chords::name (n->chord, chord, (int) sizeof (chord));
+                    std::printf ("      note at %.2f s (%.2f s long): sung %d (tracked %.2f, named %d), chord %s, target %.2f, rendered %.2f\n",
+                                 m.start, m.dur, m.midi, n->midi, n->name, chord, n->target[0] + n->tuning, got);
+                }
             }
             std::printf ("    rendered voice on its chord target: %d/%d notes\n", checked - bad, checked);
             if (bad > 0)
@@ -887,7 +897,7 @@ namespace
     }
 
     // harmony only (left channel), aligned with the input
-    std::vector<float> renderAt (const std::vector<float>& mono, double rate, const HarmonySettings& s)
+    std::vector<float> renderAt (const std::vector<float>& mono, double rate, const HarmonySettings& s, NoteList* notesOut = nullptr)
     {
         HarmonyEngine engine;
         const char* la = std::getenv ("CHV_LOOKAHEAD");   // seconds, 0 = live
@@ -901,6 +911,11 @@ namespace
             const float* ins[1] = { in.data() + pos };
             float* outs[2] = { l.data() + pos, r.data() + pos };
             engine.process (ins, 1, outs, 2, n, s);
+        }
+        if (notesOut != nullptr)
+        {
+            notesOut->clear();
+            engine.forEachNote ([notesOut] (const HarmonyEngine::NoteInfo& info) { notesOut->push_back (info); });
         }
         std::vector<float> outL ((size_t) mono.size()), outR ((size_t) mono.size());
         for (size_t i = 0; i < mono.size(); ++i)
@@ -1000,6 +1015,470 @@ namespace
                 if (hist[k] * 100 >= both)   // show intervals heard at least 1% of the time
                     std::printf ("%s %d%%  ", names[k], hist[k] * 100 / juce::jmax (1, both));
             std::printf ("\n");
+        }
+        return 0;
+    }
+
+    // Consonants in a soloed voice: 20 ms frames where the lead is making unpitched sound ("s", "h",
+    // breaths) next to sung notes, and how loud voice 1 is there compared with its level on the vowels.
+    int consonantsFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+        int len = 1;
+        while (len < rate * 0.042)
+            len <<= 1;
+        PitchTracker pt;
+        pt.prepare (rate, len, 60.0f, 1700.0f);
+        const int step = (int) (rate * 0.02);
+        const int frames = ((int) mono.size() - len) / step;
+
+        HarmonySettings s;
+        s.voice[0].solo = true;
+        if (const char* k = std::getenv ("CHV_TIGHT"))
+            s.tightness = (float) std::atof (k);
+        const auto h = renderAt (mono, rate, s);
+
+        std::vector<int> kind ((size_t) frames, 0);   // 0 silence, 1 sung (pitched), 2 unpitched sound
+        std::vector<float> ld ((size_t) frames), hd ((size_t) frames);
+        for (int k = 0; k < frames; ++k)
+        {
+            const int c = k * step + len / 4;   // YIN measures the first half of its frame
+            double el = 0.0, eh = 0.0;
+            for (int i = c - step / 2; i < c + step / 2; ++i)
+            {
+                el += (double) mono[(size_t) i] * mono[(size_t) i];
+                eh += (double) h[(size_t) i] * h[(size_t) i];
+            }
+            ld[(size_t) k] = (float) (10.0 * std::log10 (el / step + 1e-12));
+            hd[(size_t) k] = (float) (10.0 * std::log10 (eh / step + 1e-12));
+            const auto r = pt.analyse (mono.data() + k * step);
+            kind[(size_t) k] = r.f0 > 0.0f && r.aperiodicity < 0.25f ? 1 : ld[(size_t) k] > -50.0f ? 2 : 0;
+        }
+        // the voice's level on vowels, relative to the lead
+        std::vector<float> vowel, cons;
+        for (int k = 0; k < frames; ++k)
+            if (kind[(size_t) k] == 1 && ld[(size_t) k] > -40.0f)
+                vowel.push_back (hd[(size_t) k] - ld[(size_t) k]);
+        // consonant frames within 250 ms of a sung frame
+        int cut = 0;
+        for (int k = 0; k < frames; ++k)
+        {
+            if (kind[(size_t) k] != 2)
+                continue;
+            bool near = false;
+            for (int j = juce::jmax (0, k - 12); j <= juce::jmin (frames - 1, k + 12) && ! near; ++j)
+                near = kind[(size_t) j] == 1;
+            if (! near)
+                continue;
+            cons.push_back (hd[(size_t) k] - ld[(size_t) k]);
+        }
+        std::sort (vowel.begin(), vowel.end());
+        const float vowelRel = vowel.empty() ? 0.0f : vowel[vowel.size() / 2];
+        for (float x : cons)
+            cut += x < vowelRel - 20.0f ? 1 : 0;
+        std::sort (cons.begin(), cons.end());
+        std::printf ("%s: voice 1 on vowels %.1f dB vs the lead; on consonants (%zu frames) median %.1f dB, cut (20 dB below its vowel level) %.0f%%\n",
+                     file.getFileName().toRawUTF8(), vowelRel, cons.size(), cons.empty() ? 0.0f : cons[cons.size() / 2],
+                     100.0 * cut / juce::jmax ((size_t) 1, cons.size()));
+
+        // the two the listener pointed at: the end of "grace" and the start of "how"
+        for (double t : { 6.14, 6.18, 6.22, 6.26, 6.30, 6.34, 6.38, 6.42, 6.46, 7.10, 7.18 })
+        {
+            const int k = (int) ((t * rate - len / 4) / step);
+            if (k >= 0 && k < frames)
+                std::printf ("  %.2f s: lead %s %.0f dB, voice 1 %.0f dB\n", t, kind[(size_t) k] == 1 ? "sung" : kind[(size_t) k] == 2 ? "consonant" : "quiet",
+                             ld[(size_t) k], hd[(size_t) k]);
+        }
+        return 0;
+    }
+
+    // What the engine decided, note by note, in the singer's own tuning: harmony notes that clash with
+    // the lead's note, and voices that change note while the lead's note doesn't (decision flicker).
+    int choicesFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+        HarmonySettings s;
+        s.voices = 3;
+        if (const char* k = std::getenv ("CHV_HARMONY"))
+            s.harmonyMode = std::atoi (k);
+        if (const char* k = std::getenv ("CHV_KEY"))
+            s.keyMode = std::atoi (k);
+        if (const char* k = std::getenv ("CHV_SCALE"))
+            s.scaleMode = std::atoi (k);
+        if (const char* k = std::getenv ("CHV_MINNOTE"))
+            s.minNoteMs = (float) std::atof (k);
+        NoteList notes;
+        renderAt (mono, rate, s, &notes);
+
+        static const char* names[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+        double total = 0.0, clashTime[3] {};
+        int sameNoteChanges[3] {}, sameNotePairs = 0;
+        std::vector<std::string> examples;
+        for (size_t i = 0; i < notes.size(); ++i)
+        {
+            const auto& n = notes[i];
+            if (! n.harmonized)
+                continue;
+            const double d = n.end - n.start;
+            total += d;
+            bool any = false;
+            for (int v = 0; v < 3; ++v)
+            {
+                const int iv = (((int) std::lround (n.target[v]) - n.name) % 12 + 12) % 12;
+                if (n.voiceOn[v] && (iv == 1 || iv == 2 || iv == 6 || iv == 10 || iv == 11))
+                {
+                    clashTime[v] += d;
+                    any = true;
+                }
+            }
+            if (any && examples.size() < 14 && d > 0.15)
+            {
+                char buf[160], chord[16];
+                Chords::name (n.chord, chord, (int) sizeof (chord));
+                std::snprintf (buf, sizeof (buf), "    %6.2f s (%.2f s) lead %s, harmony %s %s %s, chord %s", n.start, d, names[((n.name % 12) + 12) % 12],
+                               names[(((int) std::lround (n.target[0]) % 12) + 12) % 12], names[(((int) std::lround (n.target[1]) % 12) + 12) % 12],
+                               names[(((int) std::lround (n.target[2]) % 12) + 12) % 12], chord);
+                examples.push_back (buf);
+            }
+            if (i > 0 && notes[i - 1].harmonized && notes[i - 1].name == n.name && n.start - notes[i - 1].end < 0.05)
+            {
+                ++sameNotePairs;
+                for (int v = 0; v < 3; ++v)
+                    sameNoteChanges[v] += std::lround (notes[i - 1].target[v]) != std::lround (n.target[v]) ? 1 : 0;
+            }
+        }
+        std::printf ("%s: %zu notes\n", file.getFileName().toRawUTF8(), notes.size());
+        for (int v = 0; v < 3; ++v)
+            std::printf ("  voice %d: clashes with the lead's note %.1f%% of sung time; changed note within a held lead note %d of %d times\n",
+                         v + 1, 100.0 * clashTime[v] / juce::jmax (1e-9, total), sameNoteChanges[v], sameNotePairs);
+        std::printf ("  examples (names on the singer's grid):\n");
+        for (const auto& e : examples)
+            std::printf ("%s\n", e.c_str());
+        return 0;
+    }
+
+    // Tightness on a known vibrato: one long note at A3 with ±50 cents of 5.5 Hz vibrato, a 3rd up.
+    // At Tightness 0 the harmony copies the vibrato; at 100% it should hold its target steadily.
+    int steadyCheck()
+    {
+        const int total = (int) (sr * 4.0);
+        std::vector<float> v ((size_t) total, 0.0f);
+        double phase = 0.0;
+        for (int i = (int) (0.3 * sr); i < (int) (3.7 * sr); ++i)
+        {
+            const double t = i / sr;
+            const double midi = 57.0 + (std::getenv ("CHV_NOVIB") != nullptr ? 0.0 : 0.5) * std::sin (2.0 * pi * 5.5 * t);
+            phase += 2.0 * pi * 440.0 * std::pow (2.0, (midi - 69.0) / 12.0) / sr;
+            double y = 0.0;
+            for (int k = 1; k <= 20; ++k)
+                y += std::sin (k * phase) / k;
+            v[(size_t) i] = (float) (0.2 * y);
+        }
+        PitchTracker pt;
+        pt.prepare (sr, 2048, 60.0f, 1500.0f);
+        for (float tight : { 0.0f, 0.5f, 1.0f })
+        {
+            auto s = plainVoices (1);
+            s.harmonyMode = HarmonyModes::Intervals;
+            s.keyMode = 1;   // C major: A3 -> C4
+            s.scaleMode = 1;
+            s.tightness = tight;
+            NoteList notes;
+            const auto out = runEngine (v, s, 1.0, nullptr, nullptr, nullptr, &notes);
+            if (std::getenv ("CHV_DEBUG") != nullptr)
+                for (const auto& n : notes)
+                    std::printf ("    note %.2f-%.2f midi %.3f grid %.3f\n", n.start, n.end, n.midi, n.tuning);
+            std::vector<float> p;
+            for (int a = (int) (1.0 * sr); a + 2048 < (int) (3.2 * sr); a += (int) (0.01 * sr))
+            {
+                const auto r = pt.analyse (out.getReadPointer (0) + a);
+                if (r.f0 > 0)
+                    p.push_back (1200.0f * std::log2 (r.f0 / 261.63f));   // cents from C4
+            }
+            double mean = 0.0, ss = 0.0;
+            for (float x : p)
+                mean += x;
+            mean /= juce::jmax ((size_t) 1, p.size());
+            for (float x : p)
+                ss += (x - mean) * (x - mean);
+            std::printf ("tightness %3.0f%%: harmony %+.0f ct from C4 on average, wobbling %.0f ct (lead: 35 ct)\n", tight * 100.0f,
+                         mean, std::sqrt (ss / juce::jmax ((size_t) 1, p.size())));
+        }
+        return 0;
+    }
+
+    // Each harmony voice soloed against the lead: where the lead sings but the voice is silent
+    // (missed syllables), how much the voice's interval to the lead wobbles within a held note
+    // (pitch shake), and how much its level flutters relative to the lead.
+    int voicesFile (const juce::File& file)
+    {
+        std::vector<float> mono;
+        double rate = 0.0;
+        if (! loadMono (file, mono, rate))
+            return 1;
+
+        int len = 1;
+        while (len < rate * 0.042)
+            len <<= 1;
+        PitchTracker pt;
+        pt.prepare (rate, len, 60.0f, 1700.0f);
+        const int step = (int) (rate * 0.02);
+        const int frames = ((int) mono.size() - len) / step;
+
+        struct F { float pitch, db; };
+        auto analyse = [&] (const std::vector<float>& x) {
+            std::vector<F> out ((size_t) juce::jmax (0, frames));
+            for (int k = 0; k < frames; ++k)
+            {
+                const float* p = x.data() + k * step;
+                const auto r = pt.analyse (p);
+                double e = 0.0;
+                for (int i = len / 4 - step / 2; i < len / 4 + step / 2; ++i)   // YIN measures the first half: centre there
+                    e += (double) p[i] * p[i];
+                out[(size_t) k] = { r.f0 > 0.0f && r.aperiodicity < 0.25f ? 69.0f + 12.0f * std::log2 (r.f0 / 440.0f) : 0.0f,
+                                    (float) (10.0 * std::log10 (e / step + 1e-12)) };
+            }
+            return out;
+        };
+        const auto lead = analyse (mono);
+
+        // singing: lead pitched and within 30 dB of its loudest stretches
+        std::vector<float> dbs;
+        for (const auto& f : lead)
+            if (f.pitch > 0)
+                dbs.push_back (f.db);
+        std::sort (dbs.begin(), dbs.end());
+        const float loud = dbs.empty() ? 0.0f : dbs[dbs.size() * 95 / 100];
+        auto singing = [&] (int k) { return lead[(size_t) k].pitch > 0 && lead[(size_t) k].db > loud - 30.0f; };
+
+        std::printf ("%s: %.0f s, lead sings %.0f%% of the time\n", file.getFileName().toRawUTF8(), mono.size() / rate,
+                     100.0 * std::count_if (lead.begin(), lead.end(), [&] (const F& f) { return f.pitch > 0 && f.db > loud - 30.0f; }) / juce::jmax (1, frames));
+
+        // candidate settings: entry lag ms, humanize, tightness, vibrato cents, delay of voices 2 and 3 (ms)
+        struct Candidate { const char* name; float lag, humanize, tight, vib, delay2, delay3; };
+        const HarmonySettings defaults;
+        const Candidate all[] = {
+            { "current defaults", defaults.entryLagMs, defaults.humanize, defaults.tightness, defaults.vibDepthCents,
+              defaults.voice[1].delayMs, defaults.voice[2].delayMs },
+            { "lag 10, humanize 15%, tightness 70%, vibrato 15", 10.0f, 0.15f, 0.7f, 15.0f, 12.0f, 6.0f },
+            { "as above, delays 6/3 ms", 10.0f, 0.15f, 0.7f, 15.0f, 6.0f, 3.0f },
+            { "lag 0, humanize 15%, tightness 70%, vibrato 15, delays 6/3", 0.0f, 0.15f, 0.7f, 15.0f, 6.0f, 3.0f },
+            { "everything off, tightness 100%", 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f },
+        };
+        const int numVariants = std::getenv ("CHV_ALLVARIANTS") != nullptr ? 5 : 1;
+        for (int variant = 0; variant < numVariants; ++variant)
+        {
+            const auto& c = all[variant];
+            std::printf ("  %s:\n", c.name);
+            for (int v = 0; v < 3; ++v)
+            {
+                HarmonySettings s;
+                s.voices = 3;
+                s.voice[v].solo = true;
+                s.entryLagMs = c.lag;
+                s.humanize = c.humanize;
+                s.tightness = c.tight;
+                s.vibDepthCents = c.vib;
+                s.voice[1].delayMs = c.delay2;
+                s.voice[2].delayMs = c.delay3;
+                const auto h = analyse (renderAt (mono, rate, s));
+
+                // the voice's typical level relative to the lead while both sound
+                std::vector<float> rel;
+                for (int k = 0; k < frames; ++k)
+                    if (singing (k) && h[(size_t) k].db > lead[(size_t) k].db - 40.0f)
+                        rel.push_back (h[(size_t) k].db - lead[(size_t) k].db);
+                std::sort (rel.begin(), rel.end());
+                const float typical = rel.empty() ? -20.0f : rel[rel.size() / 2];
+
+                // misses: singing frames where the voice is well below its typical level (CHV_MISSDB, default 20 dB)
+                const float missDb = std::getenv ("CHV_MISSDB") != nullptr ? (float) std::atof (std::getenv ("CHV_MISSDB")) : 20.0f;
+                int missFrames = 0, singFrames = 0, events = 0;
+                std::vector<double> times;
+                bool inMiss = false;
+                for (int k = 0; k < frames; ++k)
+                {
+                    if (! singing (k))
+                    {
+                        inMiss = false;
+                        continue;
+                    }
+                    ++singFrames;
+                    const bool miss = h[(size_t) k].db - lead[(size_t) k].db < typical - missDb;
+                    missFrames += miss ? 1 : 0;
+                    if (miss && ! inMiss)
+                    {
+                        ++events;
+                        if (times.size() < 12)
+                            times.push_back (k * step / rate + (double) len / 4 / rate);
+                    }
+                    inMiss = miss;
+                }
+
+                // shake: within runs where the rounded interval holds, spread of the interval around its median
+                std::vector<float> spreads, flutter;
+                std::vector<float> run;
+                int runInterval = 1000;
+                auto flush = [&] {
+                    if (run.size() >= 8)
+                    {
+                        std::sort (run.begin(), run.end());
+                        const float med = run[run.size() / 2];
+                        double ss = 0.0;
+                        for (float x : run)
+                            ss += (x - med) * (x - med);
+                        spreads.push_back ((float) std::sqrt (ss / run.size()));
+                    }
+                    run.clear();
+                };
+                for (int k = 1; k < frames; ++k)
+                {
+                    const auto& a = lead[(size_t) k];
+                    const auto& b = h[(size_t) k];
+                    if (singing (k) && b.pitch > 0)
+                    {
+                        const float iv = (b.pitch - a.pitch) * 100.0f;
+                        const int r = (int) std::lround (iv / 100.0f);
+                        if (r != runInterval)
+                        {
+                            flush();
+                            runInterval = r;
+                        }
+                        run.push_back (iv);
+                        if (singing (k - 1) && h[(size_t) k - 1].pitch > 0)
+                            flutter.push_back (std::abs ((b.db - a.db) - (h[(size_t) k - 1].db - lead[(size_t) k - 1].db)));
+                    }
+                    else
+                    {
+                        flush();
+                        runInterval = 1000;
+                    }
+                }
+                flush();
+                auto median = [] (std::vector<float> d) {
+                    std::sort (d.begin(), d.end());
+                    return d.empty() ? 0.0f : d[d.size() / 2];
+                };
+
+                // what a soloed voice sounds like on its own: its own pitch wobble within a note, and its
+                // frame-to-frame pitch jitter, next to the lead's
+                std::vector<float> ownSpread, ownRun, jitH, jitL;
+                int ownNote = -1000;
+                for (int k = 1; k < frames; ++k)
+                {
+                    const float p = h[(size_t) k].pitch;
+                    const int n = p > 0 && singing (k) ? (int) std::lround (p) : -1000;
+                    if (n != ownNote)
+                    {
+                        if (ownRun.size() >= 8)
+                        {
+                            const float m = median (ownRun);
+                            double ss = 0.0;
+                            for (float x : ownRun)
+                                ss += (x - m) * (x - m) * 1e4;
+                            ownSpread.push_back ((float) std::sqrt (ss / ownRun.size()));
+                        }
+                        ownRun.clear();
+                        ownNote = n;
+                    }
+                    if (n != -1000)
+                    {
+                        ownRun.push_back (p);
+                        const float pp = h[(size_t) k - 1].pitch, lp = lead[(size_t) k - 1].pitch;
+                        if (pp > 0 && std::abs (p - pp) < 0.5f)
+                            jitH.push_back (std::abs (p - pp) * 100.0f);
+                        if (lp > 0 && lead[(size_t) k].pitch > 0 && std::abs (lead[(size_t) k].pitch - lp) < 0.5f)
+                            jitL.push_back (std::abs (lead[(size_t) k].pitch - lp) * 100.0f);
+                    }
+                }
+
+                // "seizure": the voice leaves its note and comes back within 140 ms (A-B-A) while the lead's
+                // note stays the same; and clashing intervals with the lead (2nds, tritone, 7ths)
+                std::vector<int> hn ((size_t) frames, -1000), ln ((size_t) frames, -1000);
+                int clash = 0, both = 0;
+                for (int k = 0; k < frames; ++k)
+                    if (singing (k) && h[(size_t) k].pitch > 0)
+                    {
+                        hn[(size_t) k] = (int) std::lround (h[(size_t) k].pitch);
+                        ln[(size_t) k] = (int) std::lround (lead[(size_t) k].pitch);
+                        const int iv = ((hn[(size_t) k] - ln[(size_t) k]) % 12 + 12) % 12;
+                        clash += iv == 1 || iv == 2 || iv == 6 || iv == 10 || iv == 11 ? 1 : 0;
+                        ++both;
+                    }
+                struct Seg { int note, start, len; };
+                std::vector<Seg> segs;
+                for (int k = 0; k < frames; ++k)
+                {
+                    if (! segs.empty() && segs.back().note == hn[(size_t) k] && segs.back().start + segs.back().len == k)
+                        ++segs.back().len;
+                    else
+                        segs.push_back ({ hn[(size_t) k], k, 1 });
+                }
+                int flicks = 0;
+                std::vector<double> flickTimes;
+                for (size_t q = 1; q + 1 < segs.size(); ++q)
+                {
+                    const auto &a = segs[q - 1], &b = segs[q], &c = segs[q + 1];
+                    if (a.note < 0 || b.note < 0 || a.note != c.note || b.len > 7 || a.len < 2 || c.len < 2)
+                        continue;
+                    bool leadSteady = true;
+                    for (int k = b.start - 1; k <= b.start + b.len && leadSteady; ++k)
+                        leadSteady = ln[(size_t) k] == ln[(size_t) b.start - 1];
+                    if (leadSteady)
+                    {
+                        ++flicks;
+                        if (flickTimes.size() < 10)
+                            flickTimes.push_back (b.start * step / rate + (double) len / 4 / rate);
+                    }
+                }
+
+                std::printf ("    voice %d: missed %.1f%% of sung time in %d gaps; interval wobble %.0f ct; level flutter %.1f dB/20ms\n"
+                             "      own pitch wobble %.0f ct, jitter %.1f ct/20ms (lead's jitter %.1f); clashing with lead %.1f%%;"
+                             " A-B-A flicks %d (%.1f/min)",
+                             v + 1, 100.0 * missFrames / juce::jmax (1, singFrames), events, median (spreads), median (flutter),
+                             median (ownSpread), median (jitH), median (jitL), 100.0 * clash / juce::jmax (1, both), flicks,
+                             flicks * 60.0 / (mono.size() / rate));
+                for (double tm : flickTimes)
+                    std::printf (" %.2f", tm);
+                std::printf ("\n      first misses at:");
+                for (double tm : times)
+                    std::printf (" %.2f", tm);
+                std::printf ("\n");
+            }
+            std::printf ("    lead's own pitch wobble within notes: ");
+            {
+                std::vector<float> spreads, run;
+                int runNote = -1000;
+                for (int k = 0; k < frames; ++k)
+                {
+                    const float p = lead[(size_t) k].pitch;
+                    const int n = p > 0 ? (int) std::lround (p) : -1000;
+                    if (n != runNote || ! singing (k))
+                    {
+                        if (run.size() >= 8)
+                        {
+                            std::sort (run.begin(), run.end());
+                            const float med = run[run.size() / 2];
+                            double ss = 0.0;
+                            for (float x : run)
+                                ss += (x - med) * (x - med) * 1e4;
+                            spreads.push_back ((float) std::sqrt (ss / run.size()));
+                        }
+                        run.clear();
+                        runNote = n;
+                    }
+                    if (singing (k))
+                        run.push_back (p);
+                }
+                std::sort (spreads.begin(), spreads.end());
+                std::printf ("%.0f ct\n", spreads.empty() ? 0.0f : spreads[spreads.size() / 2]);
+            }
         }
         return 0;
     }
@@ -1221,6 +1700,10 @@ namespace
                 s.instrument = true;
             if (const char* k = std::getenv ("CHV_DOUBLE"))   // Double level, dB
                 s.doubleDb = (float) std::atof (k);
+            if (const char* k = std::getenv ("CHV_TIGHT"))   // Tightness 0..1
+                s.tightness = (float) std::atof (k);
+            if (const char* k = std::getenv ("CHV_SOLO"))   // solo voice 1..3
+                s.voice[juce::jlimit (1, 3, std::atoi (k)) - 1].solo = true;
             if (std::getenv ("CHV_MUTEVOICES") != nullptr)
                 for (auto& v : s.voice)
                     v.mute = true;
@@ -1269,7 +1752,7 @@ namespace
                 engine.forEachNote ([&k] (const HarmonyEngine::NoteInfo& n) {
                     char chord[16];
                     Chords::name (n.chord, chord, (int) sizeof (chord));
-                    if (k++ < 80)
+                    if (k++ < (std::getenv ("CHV_ALLNOTES") != nullptr ? 100000 : 80))
                         std::printf ("  note %3d  %6.2f-%6.2f s  %6.2f  -> %s%d  chord %s\n", k, n.start, n.end, n.midi,
                                      noteName (n.name), n.name / 12 - 1, chord);
                 });
@@ -1444,6 +1927,14 @@ int main (int argc, char** argv)
    #endif
     for (int i = 1; i + 1 < argc; ++i)
     {
+        if (juce::String (argv[i]) == "--consonants")
+            return consonantsFile (juce::File (juce::String (argv[i + 1])));
+        if (juce::String (argv[i]) == "--choices")
+            return choicesFile (juce::File (juce::String (argv[i + 1])));
+        if (juce::String (argv[i]) == "--steady")
+            return steadyCheck();
+        if (juce::String (argv[i]) == "--voices")
+            return voicesFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--onsets")
             return onsetsFile (juce::File (juce::String (argv[i + 1])));
         if (juce::String (argv[i]) == "--gates")

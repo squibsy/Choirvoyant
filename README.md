@@ -38,7 +38,7 @@ knowing what comes next. A live mode cuts the latency to 30 ms for stage use.
 |---|---|
 | Header | Key (Auto or a tonic), Mode (Auto / Major / Minor), Lookahead (Live 30 ms, 250 ms to 2 s), Source (Voice / Instrument), Key Lock, and a live readout of key, tuning offset, chord, lead and harmony notes |
 | Voice 1-3 | Chord modes: Position (Above, Above Wide, Below, Below Wide, Bass) and Motion (Follow, Hold, Contrary). Intervals mode: Interval. Always: Level, Pan, Delay, Formant offset, Mute / Solo |
-| Character | Entry Lag (late entry that catches up before the note ends), Humanize (timing and pitch drift), Auto Formant, Tightness (0 = follow the singer's inflections, 100% = harmonies exactly in tune), Min Note, Consonants (pulls sibilants and breaths out of the harmonies) |
+| Character | Entry Lag (late entry that catches up before the note ends), Humanize (timing and pitch drift), Auto Formant, Tightness (0 = follow the singer's inflections, 100% = harmonies exactly in tune), Min Note, Consonants (softens the sibilants and breaths the harmonies copy from the lead; they stay audible) |
 | Harmony | Harmony mode, Sing On (All Notes, Long Notes, Phrase Ends), Long Note threshold |
 | Vibrato | Depth, Rate, Delay. Only on notes long enough to carry it, out of phase between voices |
 | Stack | Copies per voice (1-3), Detune, Width |

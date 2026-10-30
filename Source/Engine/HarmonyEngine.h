@@ -109,24 +109,24 @@ struct HarmonySettings
 
     int voices = 2;             // 1..3
     VoiceSettings voice[3] = { { 2, -4.0f, 0.35f, 0.0f, 0.0f, Positions::Above, Motions::Follow },     // same defaults as the plugin
-                               { 8, -4.0f, -0.35f, 12.0f, 0.0f, Positions::Below, Motions::Follow },
-                               { 11, -4.0f, 0.0f, 6.0f, 0.0f, Positions::Bass, Motions::Hold } };
+                               { 8, -4.0f, -0.35f, 6.0f, 0.0f, Positions::Below, Motions::Follow },
+                               { 11, -4.0f, 0.0f, 3.0f, 0.0f, Positions::Bass, Motions::Hold } };
 
     int stack = 1;              // copies per voice, 1..3
     float stackDetuneCents = 8.0f;
     float stackWidth = 0.5f;
 
-    float entryLagMs = 25.0f;
-    float humanize = 0.3f;      // 0..1
+    float entryLagMs = 0.0f;     // late entry for a looser, backing-singer feel; 0 keeps every syllable start
+    float humanize = 0.15f;     // 0..1
     float autoFormant = 0.3f;   // fraction of the harmony interval applied to the formants
-    float tightness = 0.0f;     // 0 = follow the singer's inflections, 1 = harmonies exactly in tune
-    float minNoteMs = 80.0f;
+    float tightness = 0.3f;     // 0 = copy the singer's vibrato and wobble, 1 = harmonies hold their notes exactly
+    float minNoteMs = 180.0f;   // quicker notes (ornaments, turns) keep the previous harmony
 
-    float vibDepthCents = 20.0f;
+    float vibDepthCents = 15.0f;   // the voices' own gentle vibrato (Tightness takes out most of the singer's)
     float vibRateHz = 5.5f;
     float vibDelayMs = 250.0f;
 
-    float consonants = 0.7f;    // how much sibilants and breaths are pulled out of the harmonies
+    float consonants = 0.35f;   // how much sibilants and breaths are softened in the harmonies (they stay audible)
 
     float dryDb = 0.0f;
     float wetDb = 0.0f;
@@ -267,6 +267,8 @@ private:
 
     // ---- lookups ----
     const Frame& frameAt (double t) const;
+    float midiAt (double t) const;          // interpolated singer pitch, 0 if unvoiced
+    float periodAt (double t) const;        // source period for pitch marks, 0 where nothing is sung
     float consonanceAt (double t) const;
     int keyAt (double t) const;
     bool keyMinorAt (double t) const;
@@ -284,7 +286,7 @@ private:
     // ---- harmony ----
     void harmonize (i64 noteIdx, const HarmonySettings& s, int depth = 0);
     int chooseDegree (i64 noteIdx, int prevDegree, const Chords::Chord chords[], float grid, int majorRoot);
-    void voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, const HarmonySettings& s,
+    void voiceChord (const Note* prev, int lead, int prevLead, const Chords::Chord& chord, int majorRoot, const HarmonySettings& s,
                      float out[3]) const;
     bool noteSings (i64 noteIdx, double t, const HarmonySettings& s) const;
     void toneSpan (i64 noteIdx, i64& first, i64& last) const;

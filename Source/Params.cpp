@@ -79,7 +79,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     const int defPosition[3] = { Positions::Above, Positions::Below, Positions::Bass };
     const int defMotion[3] = { Motions::Follow, Motions::Follow, Motions::Hold };
     const float defPan[3] = { 0.35f, -0.35f, 0.0f };
-    const float defDelay[3] = { 0.0f, 12.0f, 6.0f };
+    const float defDelay[3] = { 0.0f, 6.0f, 3.0f };
 
     for (int v = 0; v < 3; ++v)
     {
@@ -117,17 +117,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     layout.add (std::move (global));
 
     auto character = std::make_unique<juce::AudioProcessorParameterGroup> ("character", "Character", "|");
-    character->addChild (std::make_unique<APF> (pid (entryLag), "Entry Lag", range (0.0f, 150.0f, 1.0f), 25.0f, msText()));
-    character->addChild (std::make_unique<APF> (pid (humanize), "Humanize", range (0.0f, 1.0f, 0.01f), 0.3f, pctText()));
+    character->addChild (std::make_unique<APF> (pid (entryLag), "Entry Lag", range (0.0f, 150.0f, 1.0f), 0.0f, msText()));
+    character->addChild (std::make_unique<APF> (pid (humanize), "Humanize", range (0.0f, 1.0f, 0.01f), 0.15f, pctText()));
     character->addChild (std::make_unique<APF> (pid (autoFormant), "Auto Formant", range (0.0f, 1.0f, 0.01f), 0.3f, pctText()));
-    character->addChild (std::make_unique<APF> (pid (tightness), "Tightness", range (0.0f, 1.0f, 0.01f), 0.0f, pctText()));
-    character->addChild (std::make_unique<APF> (pid (minNote), "Min Note", range (0.0f, 250.0f, 1.0f), 80.0f, msText()));
-    character->addChild (std::make_unique<APF> (pid (consonants), "Consonants", range (0.0f, 1.0f, 0.01f), 0.7f,
+    character->addChild (std::make_unique<APF> (pid (tightness), "Tightness", range (0.0f, 1.0f, 0.01f), 0.3f, pctText()));
+    character->addChild (std::make_unique<APF> (pid (minNote), "Min Note", range (0.0f, 400.0f, 1.0f), 180.0f, msText()));
+    character->addChild (std::make_unique<APF> (pid (consonants), "Consonants", range (0.0f, 1.0f, 0.01f), 0.35f,
                                                 withText ([] (float v) { return "-" + juce::String (juce::roundToInt (v * 100.0f)) + "%"; })));
     layout.add (std::move (character));
 
     auto vibrato = std::make_unique<juce::AudioProcessorParameterGroup> ("vibrato", "Vibrato", "|");
-    vibrato->addChild (std::make_unique<APF> (pid (vibDepth), "Vibrato Depth", range (0.0f, 80.0f, 1.0f), 20.0f, centsText()));
+    vibrato->addChild (std::make_unique<APF> (pid (vibDepth), "Vibrato Depth", range (0.0f, 80.0f, 1.0f), 15.0f, centsText()));
     vibrato->addChild (std::make_unique<APF> (pid (vibRate), "Vibrato Rate", range (3.0f, 8.0f, 0.01f), 5.5f,
                                               withText ([] (float v) { return juce::String (v, 2) + " Hz"; })));
     vibrato->addChild (std::make_unique<APF> (pid (vibDelay), "Vibrato Delay", range (0.0f, 800.0f, 1.0f), 250.0f, msText()));

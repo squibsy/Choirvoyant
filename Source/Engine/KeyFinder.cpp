@@ -49,9 +49,10 @@ namespace
     constexpr float outsideDistance = 0.7f;      // further than this from the scale = a different note, not sloppy intonation
 
     // switching because recent singing contradicts the current scale...
-    constexpr float contradictedOutside = 0.2f, contradictedMargin = 0.06f, contradictedSeconds = 0.15f;
+    constexpr float contradictedOutside = 0.2f, contradictedMargin = 0.06f, contradictedSeconds = 0.3f;   // long enough that one ornament or sloppy note can't flip the key
     // ...or because another scale fits the long window much better for a long time
     constexpr float betterMargin = 0.2f, betterSeconds = 1.5f;
+    constexpr float slowSwitchOutside = 0.08f;   // share of the long window the current scale must fail to explain
 
     constexpr float offsetStep = 0.05f;          // 5-cent grid search
     constexpr float gridFollowSeconds = 2.0f;
@@ -80,11 +81,9 @@ KeyFinder::Fit KeyFinder::evaluate (const WeightedNote* notes, int numNotes, int
         if (d > outsideDistance)
             outside += w;
 
-        // soft binning on this grid: a note between two semitones counts partly towards each
-        const float lo = std::floor (x), frac = x - lo;
-        const int pc = (((int) lo % 12) + 12) % 12;
-        hist[pc] += w * (1.0f - frac);
-        hist[(pc + 1) % 12] += w * frac;
+        // the key profile sees each note as the semitone it rounds to on this grid, so it judges the
+        // key; the fine placement of the grid is left to the distance term (soft bins pulled it off true)
+        hist[(((int) std::lround (x) % 12) + 12) % 12] += w;
     }
 
     Fit f {};
@@ -187,6 +186,7 @@ void KeyFinder::update (const WeightedNote* longNotes, int numLong, const Weight
     const bool contradicted = numShort > 0 && recent.outside > contradictedOutside;
 
     float currentScore;
+    bool allowed = true;
     if (contradicted)
     {
         search (shortNotes, numShort, grid, 0.5f, bestRoot, bestOffset, bestScore);
@@ -195,13 +195,21 @@ void KeyFinder::update (const WeightedNote* longNotes, int numLong, const Weight
     else
     {
         search (longNotes, numLong, grid, 0.5f, bestRoot, bestOffset, bestScore);
-        currentScore = evaluate (longNotes, numLong, current, grid).score;
+        const auto cur = evaluate (longNotes, numLong, current, grid);
+        currentScore = cur.score;
+
+        // A melody that never sings the note telling two keys apart (Amazing Grace never sings F or
+        // F#) fits both; the profile's sense of "home" shifts with every phrase that rests on the 5th.
+        // So a slow switch needs the current scale to miss notes that were sung and the new one to
+        // explain them, not just a better profile score.
+        const auto alt = evaluate (longNotes, numLong, bestRoot, bestOffset);
+        allowed = cur.outside > slowSwitchOutside && alt.outside < cur.outside - slowSwitchOutside / 2.0f;
     }
 
     const float needMargin = contradicted ? contradictedMargin : betterMargin;
     const int needUpdates = std::max (1, (int) std::lround ((contradicted ? contradictedSeconds : betterSeconds) * updatesPerSecond));
 
-    if (bestRoot != current && bestScore - currentScore > needMargin)
+    if (allowed && bestRoot != current && bestScore - currentScore > needMargin)
     {
         candidateRun = bestRoot == candidate ? candidateRun + 1 : 1;
         candidate = bestRoot;
