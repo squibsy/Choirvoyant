@@ -108,3 +108,7 @@ file, `CHV_NOTES=1` prints the detected notes and chords, `CHV_PITCH=1` prints t
 - Changing Lookahead resets the engine and changes the reported latency.
 - Checked on synthetic vocals and two Wikimedia Commons recordings (see `EngineTest --in`);
   not yet tried in a DAW session.
+
+## Licence
+
+JUCE 8 is used under its AGPLv3 open-source licence, so Choirvoyant is distributed under the **AGPLv3** (see `LICENSE`). Releasing it closed-source would need a commercial JUCE licence.
